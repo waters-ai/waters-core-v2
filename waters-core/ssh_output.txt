@@ -1,0 +1,2101 @@
+=== BONUS MOD ===
+pub mod personal;
+
+pub mod distribute_page;
+pub mod init;                        // 🆕
+pub mod team_operations;             // 🆕
+pub mod team_recalculate_batch;      // 🆕
+
+pub use personal::*;
+
+pub use distribute_page::*;
+pub use init::*;                     // 🆕
+pub use team_operations::*;          // 🆕
+pub use team_recalculate_batch::*;   // 🆕=== DISTRIBUTE_PAGE ===
+// src/instructions/bonus/distribute_page.rs — v3.0 FINAL
+// 🔥 Дистрибуция командного бонуса по страницам TeamChunk
+// sub_tag 253: комиссия (mode=3) для (chunk_page=0, sub_page=0)
+// Читает доли из TeamTmpSnapshot (leader_tokens, team_tokens)
+// Реальные трансферы: team_token_ata → user_token_ata
+//
+// Аккаунты:
+// 0. [signer] payer — любой член команды
+// 1. [writable] team_account — Team PDA
+// 2. [] snapshot_account — TeamTmpSnapshot PDA (доли)
+// 3. [] team_chunk_account — TeamChunk (страница N)
+// 4. [writable] team_token_ata — ATA команды (откуда)
+// 5. [] token_mint
+// 6. [] token_program
+// ... [writable] user_token_ata × N — ATA участников
+//
+// Для (chunk_page=0, sub_page=0) — комиссия:
+// + [writable] rent_pda
+// + [] system_program
+// + [writable] sol_fund
+// + [] root_pda_account
+
+use crate::{
+    constants::*,
+    error::WaterError,
+    state::{
+        team::Team,
+        team_chunk::TeamChunk,
+        team_tmp_snapshot::TeamTmpSnapshot,
+        user::User,
+    },
+    instructions::utilits::pda::{
+        derive_team_pda,
+        derive_sol_fund_pda,
+        get_root_pda_key,
+    },
+};
+use crate::instructions::utils::get_associated_token_address;
+
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    program::{invoke, invoke_signed},
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    sysvar::{rent::Rent, Sysvar},
+    msg,
+};
+use spl_token_2022_interface::instruction as token_instruction;
+use solana_system_interface::instruction as system_instruction;
+
+pub fn process_distribute_page(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    chunk_page: u8,
+    sub_page: u8,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    
+    let payer = next_account_info(accounts_iter)?;               // 0
+    let team_account = next_account_info(accounts_iter)?;        // 1
+    let snapshot_account = next_account_info(accounts_iter)?;    // 2
+    let team_chunk_account = next_account_info(accounts_iter)?;  // 3
+    let team_token_ata = next_account_info(accounts_iter)?;      // 4
+    let token_mint = next_account_info(accounts_iter)?;          // 5
+    let token_program = next_account_info(accounts_iter)?;       // 6
+    
+    // Комиссия только для самого первого батча
+    let (rent_pda, system_program, sol_fund, root_pda_account) = 
+        if chunk_page == 0 && sub_page == 0 {
+            let rp = next_account_info(accounts_iter)?;
+            let sp = next_account_info(accounts_iter)?;
+            let sf = next_account_info(accounts_iter)?;
+            let rpa = next_account_info(accounts_iter)?;
+            (Some(rp), Some(sp), Some(sf), Some(rpa))
+        } else {
+            (None, None, None, None)
+        };
+    
+    let user_atas = accounts_iter.as_slice();
+    
+    // ==================== ПРОВЕРКИ ====================
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    
+    if team_account.owner != program_id || snapshot_account.owner != program_id {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+    
+    let team = Team::load(team_account)?;
+    let (expected_team_pda, _) = derive_team_pda(program_id, &team.immutable.leader);
+    if team_account.key != &expected_team_pda {
+        return Err(WaterError::InvalidPDA.into());
+    }
+    
+    // Проверка членства
+    let (user_pda, _) = User::find_user_address(program_id, payer.key);
+    let user_account = accounts.iter().find(|acc| acc.key == &user_pda)
+        .ok_or(WaterError::InvalidAccountData)?;
+    let user = User::get_user(user_account, program_id)?;
+    
+    if user.team_id.map_or(true, |tid| tid != expected_team_pda) {
+        return Err(WaterError::Unauthorized.into());
+    }
+    
+    // Проверка статуса бонуса
+    let current_rank = team.mutable.current_rank;
+    if !team.is_bonus_claimed(current_rank) {
+        return Err(WaterError::MustCompleteDistribution.into());
+    }
+    if team.is_bonus_distributed(current_rank) {
+        return Err(WaterError::MustCompleteDistribution.into());
+    }
+    
+    // Загрузка снапшота для долей
+    let snapshot = TeamTmpSnapshot::load(snapshot_account)?;
+    
+    if !snapshot.is_ready_for_distribution() {
+        return Err(WaterError::SnapshotNotFinalized.into());
+    }
+    
+    // Проверка PDA TeamChunk
+    let (expected_chunk_pda, _) = TeamChunk::find_chunk_pda(
+        program_id, &team.immutable.leader, chunk_page
+    );
+    if team_chunk_account.key != &expected_chunk_pda {
+        return Err(WaterError::InvalidPDA.into());
+    }
+    
+    // ==================== КОМИССИЯ (первый батч) ====================
+    if chunk_page == 0 && sub_page == 0 {
+        let rent = Rent::get()?;
+        let team_rent = rent.minimum_balance(Team::LEN);
+        let ata_rent = rent.minimum_balance(165);
+        
+        let chunk = TeamChunk::load(team_chunk_account)?;
+        let chunk_size = TeamChunk::size_for_capacity(chunk.capacity);
+        let chunk_rent = rent.minimum_balance(chunk_size);
+        
+        let commission = team_rent
+            .checked_add(ata_rent)
+            .and_then(|v| v.checked_add(chunk_rent))
+            .ok_or(WaterError::InvalidTransfer)?;
+        
+        msg!("💰 Commission: {} lamports (Team={} + ATA={} + Chunk(cap={})={})",
+            commission, team_rent, ata_rent, chunk.capacity, chunk_rent);
+        
+        if **payer.try_borrow_lamports()? < commission {
+            return Err(WaterError::InsufficientBalance.into());
+        }
+        
+        let rent_pda = rent_pda.unwrap();
+        let system_program = system_program.unwrap();
+        let sol_fund = sol_fund.unwrap();
+        let root_pda_account = root_pda_account.unwrap();
+        
+        // Проверка SOL Fund
+        let root_pda = get_root_pda_key(program_id, root_pda_account)?;
+        let (expected_sol_fund, _) = derive_sol_fund_pda(program_id, &root_pda);
+        if sol_fund.key != &expected_sol_fund || sol_fund.owner != program_id {
+            return Err(WaterError::InvalidPDA.into());
+        }
+        
+        invoke(
+            &system_instruction::transfer(payer.key, rent_pda.key, commission),
+            &[payer.clone(), rent_pda.clone(), system_program.clone()],
+        )?;
+        msg!("💰 PAID: {} lamports to shard", commission);
+        
+        // Возврат излишков
+        let shard_balance = **rent_pda.try_borrow_lamports()?;
+        let min_shard = rent.minimum_balance(rent_pda.data_len());
+        let target = min_shard.checked_mul(5).ok_or(WaterError::InvalidTransfer)?;
+        
+        if shard_balance > target {
+            let surplus = shard_balance - target;
+            **rent_pda.try_borrow_mut_lamports()? = target;
+            **sol_fund.try_borrow_mut_lamports()? = sol_fund.lamports()
+                .checked_add(surplus)
+                .ok_or(WaterError::InvalidTransfer)?;
+            msg!("💰 Surplus {} lamports to SOL Fund", surplus);
+        }
+    }
+    
+    // ==================== ЗАГРУЗКА УЧАСТНИКОВ ====================
+    let team_chunk = TeamChunk::load(team_chunk_account)?;
+    let members = team_chunk.get_all_members(team_chunk_account)?;
+    
+    // Дробление на подстраницы
+    let start_idx = (sub_page as usize) * 53;
+    let end_idx = std::cmp::min(start_idx + 53, members.len());
+    
+    if start_idx >= members.len() {
+        msg!("⚠️ Empty sub-page: chunk={}, sub={}", chunk_page, sub_page);
+        return Ok(());
+    }
+    
+    let batch_members = &members[start_idx..end_idx];
+    
+    // Данные для расчета долей
+    let acc = snapshot.get_accumulated_data();
+    let team_pool = acc.total_contribution.saturating_sub(acc.leader_contribution);
+    
+    let mut processed_count = 0u32;
+    let mut page_distributed = 0u64;
+    
+    // ==================== ДИСТРИБУЦИЯ ====================
+    for (i, member_pubkey) in batch_members.iter().enumerate() {
+        if i >= user_atas.len() {
+            break;
+        }
+        
+        let user_ata = &user_atas[i];
+        
+        // Проверка ATA
+        let expected_ata = get_associated_token_address(member_pubkey, token_mint.key);
+        if user_ata.key != &expected_ata {
+            continue;
+        }
+        
+        // Contribution участника
+        let (user_pda, _) = User::find_user_address(program_id, member_pubkey);
+        let user_contrib = accounts.iter()
+            .find(|acc| acc.key == &user_pda)
+            .and_then(|ua| User::get_user(ua, program_id).ok())
+            .map(|u| u.team_contribution)
+            .unwrap_or(0);
+        
+        if user_contrib == 0 {
+            continue;
+        }
+        
+        // Расчет доли
+        let share = if *member_pubkey == team.immutable.leader {
+            snapshot.leader_tokens
+        } else if team_pool > 0 {
+            (user_contrib as u128 * snapshot.team_tokens as u128 / team_pool as u128) as u64
+        } else {
+            0
+        };
+        
+        if share == 0 {
+            continue;
+        }
+        
+        // 🔥 ТРАНСФЕР ТОКЕНОВ
+        let (team_pda, team_bump) = derive_team_pda(program_id, &team.immutable.leader);
+        let seeds = &[b"team", team.immutable.leader.as_ref(), &[team_bump]];
+        
+        let transfer_ix = token_instruction::transfer_checked(
+            token_program.key,
+            team_token_ata.key,
+            token_mint.key,
+            user_ata.key,
+            &team_pda,
+            &[],
+            share,
+            OUR_TOKEN_DECIMALS,
+        )?;
+        
+        invoke_signed(
+            &transfer_ix,
+            &[
+                team_token_ata.clone(),
+                user_ata.clone(),
+                token_mint.clone(),
+                token_program.clone(),
+            ],
+            &[seeds],
+        )?;
+        
+        page_distributed += share;
+        processed_count += 1;
+        
+        msg!("♒~~~🌊🌊🌊~~~:DISTRIBUTED:team={}:rank={}:user={}:amount={}:contrib={}",
+            team.immutable.leader, current_rank, member_pubkey, share, user_contrib);
+    }
+    
+    // ==================== ЗАВЕРШЕНИЕ ====================
+    // Последняя подстраница последней страницы
+    let is_last_chunk = chunk_page + 1 >= team.mutable.num_pages;
+    let is_last_sub = end_idx >= members.len();
+    
+    if is_last_chunk && is_last_sub {
+        let mut team_mut = Team::load(team_account)?;
+        team_mut.mark_bonus_distributed(current_rank);
+        team_mut.mutable.has_pending_distribution = false;
+        team_mut.save(team_account)?;
+        
+        msg!("♒~~~🌊🌊🌊~~~:DISTRIBUTION_COMPLETE:team={}:rank={}",
+            team.immutable.leader, current_rank);
+    }
+    
+    msg!("♒~~~🌊🌊🌊~~~:DISTRIBUTE_PAGE:team={}:chunk={}:sub={}:processed={}:amount={}",
+        team.immutable.leader, chunk_page, sub_page, processed_count, page_distributed);
+    
+    Ok(())
+}=== INIT ===
+// src/instructions/bonus/init.rs — v1.0
+// 🔥 Инициализация перерасчета с комиссией
+// sub_tag 0: PAY_AND_INIT
+
+use crate::{
+    constants::*,
+    error::WaterError,
+    state::{
+        team::Team,
+        team_chunk::TeamChunk,
+        team_tmp_snapshot::TeamTmpSnapshot,
+        user::User,
+    },
+    instructions::utilits::pda::{
+        derive_team_pda,
+        derive_sol_fund_pda,
+        get_root_pda_key,
+    },
+};
+
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    program::{invoke, invoke_signed},
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    sysvar::{rent::Rent, clock::Clock, Sysvar},
+    msg,
+};
+use solana_system_interface::instruction as system_instruction;
+
+/// Аккаунты:
+/// 0. [signer] payer — любой член команды
+/// 1. [writable] team_account — Team PDA
+/// 2. [writable] snapshot_account — TeamTmpSnapshot PDA (создается здесь)
+/// 3. [] team_chunk_account — TeamChunk (страница 0, для проверки)
+/// 4. [] token_mint
+/// 5. [writable] rent_pda — шард плательщика
+/// 6. [] system_program
+/// 7. [writable] sol_fund — SOL Fund PDA
+/// 8. [] root_pda_account — Root PDA
+/// 9. [] team_ata_account — ATA команды (для расчета комиссии)
+pub fn process_init_recalculation(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    
+    let payer = next_account_info(accounts_iter)?;              // 0
+    let team_account = next_account_info(accounts_iter)?;       // 1
+    let snapshot_account = next_account_info(accounts_iter)?;   // 2
+    let _team_chunk = next_account_info(accounts_iter)?;        // 3
+    let _token_mint = next_account_info(accounts_iter)?;        // 4
+    let rent_pda = next_account_info(accounts_iter)?;           // 5
+    let system_program = next_account_info(accounts_iter)?;     // 6
+    let sol_fund = next_account_info(accounts_iter)?;           // 7
+    let root_pda_account = next_account_info(accounts_iter)?;   // 8
+    let team_ata_account = next_account_info(accounts_iter)?;   // 9
+    
+    // ==================== ПРОВЕРКИ ====================
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    
+    if team_account.owner != program_id {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+    if rent_pda.owner != program_id {
+        return Err(WaterError::IllegalOwner.into());
+    }
+    
+    let root_pda = get_root_pda_key(program_id, root_pda_account)?;
+    let (expected_sol_fund, _) = derive_sol_fund_pda(program_id, &root_pda);
+    if sol_fund.key != &expected_sol_fund || sol_fund.owner != program_id {
+        return Err(WaterError::InvalidPDA.into());
+    }
+    
+    let mut team = Team::load(team_account)?;
+    let (expected_team_pda, _) = derive_team_pda(program_id, &team.immutable.leader);
+    if team_account.key != &expected_team_pda {
+        return Err(WaterError::InvalidPDA.into());
+    }
+    
+    // Проверка членства
+    let (user_pda, _) = User::find_user_address(program_id, payer.key);
+    let user_account = accounts.iter().find(|acc| acc.key == &user_pda)
+        .ok_or(WaterError::InvalidAccountData)?;
+    let user = User::get_user(user_account, program_id)?;
+    
+    if user.team_id.map_or(true, |tid| tid != expected_team_pda) {
+        return Err(WaterError::Unauthorized.into());
+    }
+    
+    // ==================== КОМИССИЯ ====================
+    let rent = Rent::get()?;
+    let team_rent = rent.minimum_balance(Team::LEN);
+    let ata_rent = rent.minimum_balance(165);
+    let snapshot_rent = rent.minimum_balance(TeamTmpSnapshot::LEN);
+    
+    let commission = team_rent
+        .checked_add(ata_rent)
+        .and_then(|v| v.checked_add(snapshot_rent))
+        .ok_or(WaterError::InvalidTransfer)?;
+    
+    msg!("💰 Commission: {} lamports (Team={} + ATA={} + Snapshot={})",
+        commission, team_rent, ata_rent, snapshot_rent);
+    
+    if **payer.try_borrow_lamports()? < commission {
+        return Err(WaterError::InsufficientBalance.into());
+    }
+    
+    invoke(
+        &system_instruction::transfer(payer.key, rent_pda.key, commission),
+        &[payer.clone(), rent_pda.clone(), system_program.clone()],
+    )?;
+    msg!("💰 PAID: {} lamports to shard", commission);
+    
+    // ==================== ВОЗВРАТ ИЗЛИШКОВ В SOL FUND ====================
+    let shard_balance = **rent_pda.try_borrow_lamports()?;
+    let min_shard = rent.minimum_balance(rent_pda.data_len());
+    let target = min_shard.checked_mul(5).ok_or(WaterError::InvalidTransfer)?;
+    
+    if shard_balance > target {
+        let surplus = shard_balance - target;
+        **rent_pda.try_borrow_mut_lamports()? = target;
+        **sol_fund.try_borrow_mut_lamports()? = sol_fund.lamports()
+            .checked_add(surplus)
+            .ok_or(WaterError::InvalidTransfer)?;
+        msg!("💰 Surplus {} lamports returned to SOL Fund", surplus);
+    }
+    
+    // ==================== СОЗДАНИЕ SNAPSHOT PDA ====================
+    let target_rank = team.mutable.current_rank + 1;
+    let (snapshot_pda, snapshot_bump) = TeamTmpSnapshot::find_pda(
+        program_id, &team.immutable.leader, target_rank
+    );
+    
+    if snapshot_account.key != &snapshot_pda {
+        msg!("❌ Wrong snapshot PDA: expected {}", snapshot_pda);
+        return Err(WaterError::InvalidPDA.into());
+    }
+    
+    let seeds = &[
+        b"team_snapshot",
+        team.immutable.leader.as_ref(),
+        &[target_rank],
+        &[snapshot_bump],
+    ];
+    
+    // Выделяем память
+    invoke_signed(
+        &system_instruction::allocate(snapshot_account.key, TeamTmpSnapshot::LEN as u64),
+        &[snapshot_account.clone(), system_program.clone()],
+        &[seeds],
+    )?;
+    
+    // Назначаем владельца
+    invoke_signed(
+        &system_instruction::assign(snapshot_account.key, program_id),
+        &[snapshot_account.clone(), system_program.clone()],
+        &[seeds],
+    )?;
+    
+    // Аренда из шарда
+    **rent_pda.try_borrow_mut_lamports()? -= snapshot_rent;
+    **snapshot_account.try_borrow_mut_lamports()? += snapshot_rent;
+    
+    // Инициализируем данные снапшота
+    let snapshot = TeamTmpSnapshot::new(
+        team.immutable.leader,
+        target_rank,
+        team.mutable.num_pages,
+        snapshot_bump,
+    );
+    snapshot.save(snapshot_account)?;
+    
+    // ==================== 🔓 ОТКРЫВАЕМ ДВЕРЬ ====================
+    team.mutable.is_recalculating = true;
+    team.mutable.last_recalculation_time = Clock::get()?.unix_timestamp;
+    team.save(team_account)?;
+    
+    msg!("🔓 DOOR OPENED: team={}, target_rank={}, pages={}",
+        team.immutable.leader, target_rank, team.mutable.num_pages);
+    msg!("✅ INIT DONE");
+    
+    Ok(())
+}=== PERSONAL ===
+// src/instructions/bonus/personal.rs — v7.0 (ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ)
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use crate::{
+    constants::*,
+    error::WaterError,
+    instructions::utils::account_utils::get_total_token_balance,
+    instructions::utils::get_associated_token_address,
+    state::{
+        referral_chunk::ReferralChunk,
+        mem_rank_config::MemRankConfig,
+        user::User,
+        team::Team,
+        team_chunk::TeamChunk,
+        config_trait::ConfigAccount,
+        PlayerStakeData,
+    },
+    utils::validation_utils::{self, validate_root_pda_v2},
+    types::MemRankRequirements,
+    instructions::utilits::pda::{
+        derive_bonus_fund_pda,
+        derive_team_pda,
+    },
+};
+
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    clock::Clock,
+    entrypoint::ProgramResult,
+    msg,
+    program::invoke_signed,
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    sysvar::Sysvar,
+};
+use spl_token_2022_interface::instruction as token_instruction;
+use spl_token_2022_interface::state::Mint;
+use spl_token_2022_interface::extension::StateWithExtensions;
+
+#[inline(never)]
+pub fn update_mem_rank<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+) -> ProgramResult {
+    let mut account_iter = accounts.iter();
+
+    // ==================== 1. РАЗБОР АККАУНТОВ (14 аккаунтов) ====================
+    let claimant_info = next_account_info(&mut account_iter)?;                    // 0
+    let claimant_token_account_info = next_account_info(&mut account_iter)?;      // 1
+    let user_account = next_account_info(&mut account_iter)?;                     // 2
+    let token_mint_info = next_account_info(&mut account_iter)?;                  // 3
+    let token_program_info = next_account_info(&mut account_iter)?;               // 4
+    let mem_rank_config_info = next_account_info(&mut account_iter)?;             // 5
+    let stake_data_account = next_account_info(&mut account_iter)?;               // 6
+    let bonus_fund_account = next_account_info(&mut account_iter)?;               // 7
+    let immutable_seed_account = next_account_info(&mut account_iter)?;           // 8
+    let bonus_fund_ata = next_account_info(&mut account_iter)?;                   // 9
+    let user_token_ata = next_account_info(&mut account_iter)?;                   // 10
+    let associated_token_program = next_account_info(&mut account_iter)?;         // 11
+    let team_chunk_account = next_account_info(&mut account_iter)?;               // 12
+    let team_account = next_account_info(&mut account_iter)?;                     // 13
+
+    // ==================== 2. ПРОВЕРКИ ====================
+    if !claimant_info.is_signer {
+        msg!("♒~~~⚡~~~:FEE:user={}:amount=0:reason=MISSING_SIGNATURE", claimant_info.key);
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    for acc in &[user_account, mem_rank_config_info, bonus_fund_account, stake_data_account] {
+        if acc.owner != program_id {
+            msg!("❌ Неверный owner: {}", acc.key);
+            return Err(ProgramError::InvalidAccountOwner);
+        }
+    }
+    
+    for acc in &[claimant_token_account_info, bonus_fund_ata, user_token_ata] {
+        if acc.owner != token_program_info.key {
+            msg!("❌ Неверный owner ATA: {}", acc.key);
+            return Err(ProgramError::InvalidAccountOwner);
+        }
+    }
+
+    if *token_program_info.key != spl_token_2022_interface::ID {
+        msg!("❌ Неверная токен программа!");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    // Проверка mint
+    {
+        let mint_data = token_mint_info.data.borrow();
+        let mint = StateWithExtensions::<Mint>::unpack(&mint_data)
+            .map_err(|_| WaterError::InvalidAccountData)?;
+        if mint.base.decimals != OUR_TOKEN_DECIMALS {
+            msg!("❌ Неверный decimals!");
+            return Err(WaterError::InvalidDecimals.into());
+        }
+    }
+
+    let root_pda = validate_root_pda_v2(program_id, immutable_seed_account)?;
+    let mem_rank_config = MemRankConfig::get_config(mem_rank_config_info, program_id, &root_pda)?;
+
+    // Проверки PDA
+    let (expected_user_pda, _) = User::find_user_address(program_id, claimant_info.key);
+    if user_account.key != &expected_user_pda {
+        msg!("❌ Неверный User PDA!");
+        return Err(WaterError::InvalidPDA.into());
+    }
+
+    let (expected_stake_pda, _) = PlayerStakeData::find_stake_data_address(program_id, claimant_info.key);
+    if stake_data_account.key != &expected_stake_pda {
+        msg!("❌ Неверный Stake Data PDA!");
+        return Err(WaterError::InvalidPDA.into());
+    }
+
+    let expected_claimant_ata = get_associated_token_address(claimant_info.key, token_mint_info.key);
+    if claimant_token_account_info.key != &expected_claimant_ata {
+        msg!("❌ Неверный claimant ATA!");
+        return Err(WaterError::InvalidPDA.into());
+    }
+
+    let expected_user_ata = get_associated_token_address(claimant_info.key, token_mint_info.key);
+    if user_token_ata.key != &expected_user_ata {
+        msg!("❌ Неверный User ATA!");
+        return Err(WaterError::InvalidPDA.into());
+    }
+
+    let (expected_bonus_fund, bonus_bump) = derive_bonus_fund_pda(program_id, &root_pda);
+    if bonus_fund_account.key != &expected_bonus_fund {
+        msg!("❌ Неверный Bonus Fund PDA!");
+        return Err(WaterError::InvalidPDA.into());
+    }
+
+    let expected_bonus_ata = get_associated_token_address(&expected_bonus_fund, token_mint_info.key);
+    if bonus_fund_ata.key != &expected_bonus_ata {
+        msg!("❌ Неверный Bonus Fund ATA!");
+        return Err(WaterError::InvalidPDA.into());
+    }
+
+    // ==================== 3. ЗАГРУЗКА ПОЛЬЗОВАТЕЛЯ ====================
+    let mut user = User::get_user(user_account, program_id)?;
+    if user.user_pubkey != *claimant_info.key {
+        msg!("❌ User mismatch!");
+        return Err(WaterError::InvalidAccountData.into());
+    }
+
+    let current_time = Clock::get()?.unix_timestamp;
+    let old_rank = user.current_rank;
+
+    // ==================== 4. СБОР ДАННЫХ ====================
+    let total_tokens = get_total_token_balance(claimant_token_account_info, stake_data_account)?;
+    user.referral_tree_size = ReferralChunk::get_referral_tree_size(program_id, &user.user_pubkey, accounts)?;
+
+    // ==================== 5. ПРОВЕРКА ПОВЫШЕНИЯ (+1) ====================
+    let mut new_rank = user.current_rank;
+    let mut rank_updated = false;
+    
+    if new_rank < MAX_MEM_RANKS as u8 - 1 {
+        let next_req = &mem_rank_config.mem_ranks[(new_rank + 1) as usize];
+        if next_req.is_active
+            && total_tokens >= next_req.min_tokens.into()
+            && user.total_stake_hours >= next_req.min_stake_hours
+            && user.referral_tree_size >= u32::from(next_req.min_referral_tree_size)
+            && check_member_requirements(
+                program_id,
+                &user,
+                next_req,
+                team_chunk_account,
+                team_account,
+                accounts,
+            )?
+        {
+            new_rank += 1;
+            rank_updated = true;
+        }
+    }
+    
+    // ==================== 6. ВЫПЛАТА БОНУСА ИЗ BONUS_FUND ====================
+    if rank_updated && new_rank > old_rank {
+        user.current_rank = new_rank;
+        user.last_rank_update = current_time;
+        
+        if !user.personal_rewards_claimed[new_rank as usize] {
+            let reward_amount = mem_rank_config.mem_rank_rewards[new_rank as usize];
+            if reward_amount > 0 {
+                if get_token_balance(bonus_fund_ata)? < reward_amount {
+                    msg!("❌ Недостаточно средств в Bonus Fund!");
+                    return Err(WaterError::InsufficientFunds.into());
+                }
+                
+                let transfer_ix = token_instruction::transfer_checked(
+                    token_program_info.key,
+                    bonus_fund_ata.key,
+                    token_mint_info.key,
+                    user_token_ata.key,
+                    bonus_fund_account.key,
+                    &[],
+                    reward_amount,
+                    OUR_TOKEN_DECIMALS,
+                )?;
+                
+                let bump_arr = [bonus_bump];
+                let seeds: &[&[&[u8]]] = &[&[BONUS_FUND_SEED, root_pda.as_ref(), &[0u8], &bump_arr]];
+                
+                invoke_signed(
+                    &transfer_ix,
+                    &[
+                        bonus_fund_ata.clone(),
+                        user_token_ata.clone(),
+                        token_mint_info.clone(),
+                        bonus_fund_account.clone(),
+                        token_program_info.clone(),
+                    ],
+                    seeds,
+                )?;
+                
+                user.personal_rewards_claimed[new_rank as usize] = true;
+                
+                msg!("♒~~~💧💧💧~~~:PAID:user={}:rank={}:amount={}",
+                    user.user_pubkey, new_rank, reward_amount);
+            }
+        }
+    }
+
+    // ==================== 7. ПОНИЖЕНИЕ ====================
+    if !rank_updated {
+        let mut check_rank = user.current_rank;
+        while check_rank > 0 {
+            let req = &mem_rank_config.mem_ranks[check_rank as usize];
+            if req.is_active
+                && total_tokens >= u64::from(req.min_tokens)
+                && user.total_stake_hours >= req.min_stake_hours
+                && user.referral_tree_size >= u32::from(req.min_referral_tree_size)
+                && check_member_requirements(
+                    program_id,
+                    &user,
+                    req,
+                    team_chunk_account,
+                    team_account,
+                    accounts,
+                )?
+            {
+                break;
+            }
+            check_rank -= 1;
+        }
+        if check_rank < user.current_rank {
+            user.current_rank = check_rank;
+            user.last_rank_update = current_time;
+            msg!("♒~~~💧💧💧~~~:RANK_DOWN:user={}:old_rank={}:new_rank={}",
+                user.user_pubkey, old_rank, user.current_rank);
+        }
+    }
+
+    // ==================== 8. СОХРАНЕНИЕ ====================
+    user.serialize(&mut *user_account.data.borrow_mut())?;
+    Ok(())
+}
+
+// ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+
+fn get_token_balance(account: &AccountInfo) -> Result<u64, WaterError> {
+    crate::instructions::utils::account_utils::get_token_balance(account)
+        .map_err(|_| WaterError::InvalidAccountData)
+}
+
+fn check_member_requirements<'a>(
+    program_id: &Pubkey,
+    user: &User,
+    req: &MemRankRequirements,
+    team_chunk_account: &AccountInfo<'a>,
+    team_account: &AccountInfo<'a>,
+    referral_accounts: &'a [AccountInfo<'a>],
+) -> Result<bool, WaterError> {
+    let has_requirements = req.required_members.iter().any(|&r| r > 0);
+    if !has_requirements {
+        return Ok(true);
+    }
+
+    let mut rank_counts = [0u32; MAX_MEM_RANKS];
+    for page in 0..MAX_REFERRAL_PAGES {
+        let (chunk_pda, _) = ReferralChunk::find_chunk_pda(program_id, &user.user_pubkey, page as u8);
+        for acc in referral_accounts {
+            if acc.key != &chunk_pda || acc.data_is_empty() {
+                continue;
+            }
+            if let Ok(chunk) = ReferralChunk::try_from_slice(&acc.data.borrow()) {
+                for entry in chunk.entries.iter().flatten() {
+                    let (child_pda, _) = User::find_user_address(program_id, &entry.child);
+                    for child_acc in referral_accounts {
+                        if child_acc.key != &child_pda { continue; }
+                        if child_acc.owner != program_id { continue; }
+                        if let Ok(child) = User::try_from_slice(&child_acc.data.borrow()) {
+                            if (child.current_rank as usize) < MAX_MEM_RANKS {
+                                rank_counts[child.current_rank as usize] += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    for (rank_idx, &required) in req.required_members.iter().enumerate() {
+        if required > 0 {
+            if rank_counts[rank_idx] < required as u32 {
+                return Ok(false);
+            }
+        }
+    }
+
+    Ok(true)
+}=== TEAM_OPERATIONS ===
+// src/instructions/bonus/team_operations.rs — v2.0
+// 🔥 ЕДИНЫЙ ВХОД ДЛЯ ВСЕХ ОПЕРАЦИЙ С КОМАНДОЙ (тег 7)
+// Только проверка двери + маршрутизация
+
+use crate::{
+    error::WaterError,
+    state::team::Team,
+};
+use solana_program::{
+    account_info::AccountInfo,
+    entrypoint::ProgramResult,
+    pubkey::Pubkey,
+    msg,
+};
+
+pub fn process_team_operations(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if data.is_empty() {
+        return Err(solana_program::program_error::ProgramError::InvalidInstructionData.into());
+    }
+    msg!("data[0]={} data[1]={}", data[0], data[1]);
+    let sub_tag = data[0];
+    let rest = &data[1..];
+    
+    match sub_tag {
+        0 => {
+            msg!("🔓 TEAM_OP: INIT");
+            let team = Team::load(&accounts[1])?;
+            if team.mutable.is_recalculating {
+                return Err(WaterError::SnapshotAlreadyExists.into());
+            }
+            super::init::process_init_recalculation(program_id, accounts)
+        }
+        
+        1..=250 => {
+            let page = sub_tag - 1;
+            msg!("📊 TEAM_OP: BATCH page={}", page);
+            let team = Team::load(&accounts[1])?;
+            if !team.mutable.is_recalculating {
+                return Err(WaterError::SnapshotNotFinalized.into());
+            }
+            super::team_recalculate_batch::process_recalculate_batch(program_id, accounts, page)
+        }
+        
+        251 => {
+            msg!("🔍 TEAM_OP: FINALIZE");
+            let team = Team::load(&accounts[1])?;
+            if !team.mutable.is_recalculating {
+                return Err(WaterError::SnapshotNotFinalized.into());
+            }
+            super::team_recalculate_batch::finalize_recalculation(program_id, accounts)
+        }
+        
+        252 => {
+            let new_rank = rest.first().copied().unwrap_or(0);
+            msg!("💰 TEAM_OP: APPLY_RANK new_rank={}", new_rank);
+            let team = Team::load(&accounts[1])?;
+            if !team.mutable.is_recalculating {
+                return Err(WaterError::InvalidRank.into());
+            }
+            super::team_recalculate_batch::apply_rank_change(program_id, accounts, new_rank)
+        }
+        
+        253 => {
+            let chunk_page = rest.first().copied().unwrap_or(0);
+            let sub_page = rest.get(1).copied().unwrap_or(0);
+            msg!("💸 TEAM_OP: DISTRIBUTE chunk={}, sub={}", chunk_page, sub_page);
+            super::distribute_page::process_distribute_page(program_id, accounts, chunk_page, sub_page)
+        },
+        
+        254 => {
+            msg!("🔒 TEAM_OP: CLOSE");
+            close_door(accounts)
+        }
+        
+        _ => Err(solana_program::program_error::ProgramError::InvalidInstructionData.into()),
+    }
+}
+
+fn close_door(accounts: &[AccountInfo]) -> ProgramResult {
+    let team_account = &accounts[1];
+    let mut team = Team::load(team_account)?;
+    team.mutable.is_recalculating = false;
+    team.save(team_account)?;
+    msg!("🔒 DOOR CLOSED");
+    Ok(())
+}=== TEAM_RECALCULATE_BATCH ===
+// src/instructions/bonus/team_recalculate_batch.rs — v6.0 FINAL
+// 🔥 Полный цикл перерасчета и повышения ранга команды
+//
+// Фаза 1: process_recalculate_batch() — сбор данных по страницам (без комиссии)
+// Фаза 2: finalize_recalculation()    — проверка условий ранга (без комиссии)
+// Фаза 3: apply_rank_change()         — выплата + снапшот + обновление (с комиссией mode=2)
+//
+// 🔥 ИЗМЕНЕНИЯ v6.0:
+//    - Комиссия mode=2 в apply_rank_change (Team + ATA + Snapshot)
+//    - Убран is_recalculating = false (закрывается через sub_tag 254)
+//    - Лидер в снапшоте отдельной мессагой SNAPSHOT_LEADER
+//    - total_stake_hours НЕ перезаписывается
+
+use crate::{
+    constants::*,
+    error::WaterError,
+    state::{
+        team::Team,
+        team_chunk::TeamChunk,
+        team_tmp_snapshot::TeamTmpSnapshot,
+        team_rank_config::TeamRankConfig,
+        config_trait::ConfigAccount,
+        user::User,
+        PlayerStakeData,
+    },
+    types::TeamRankRequirements,
+    utils::validation_utils::{self, validate_root_pda_v2},
+    instructions::utilits::pda::{
+        derive_team_pda,
+        derive_bonus_fund_pda,
+        derive_sol_fund_pda,
+        get_root_pda_key,
+    },
+};
+use crate::instructions::utils::get_associated_token_address;
+use crate::instructions::utils::account_utils::{get_token_balance, get_total_token_balance};
+
+use borsh::BorshDeserialize;
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    program::{invoke_signed, invoke},
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    sysvar::{rent::Rent, clock::Clock, Sysvar},
+    msg,
+};
+use spl_token_2022_interface::instruction as token_instruction;
+use spl_token_2022_interface::state::Mint;
+use spl_token_2022_interface::extension::StateWithExtensions;
+use solana_system_interface::instruction as system_instruction;
+
+// ==================== ТРАНЗАКЦИЯ 1: БАТЧ-ПЕРЕРАСЧЕТ (БЕЗ КОМИССИИ) ====================
+
+/// Аккаунты:
+/// 0. [signer] payer
+/// 1. [writable] team_account
+/// 2. [writable] snapshot_account
+/// 3. [] team_rank_config
+/// 4. [] team_chunk_account (страница N)
+/// 5. [] token_mint
+/// 6. [] system_program
+/// ... user_pda + token_ata + stake_data × 19
+pub fn process_recalculate_batch(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    page: u8,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    
+    let payer = next_account_info(accounts_iter)?;               // 0
+    let team_account = next_account_info(accounts_iter)?;        // 1
+    let snapshot_account = next_account_info(accounts_iter)?;    // 2
+    let _team_rank_config = next_account_info(accounts_iter)?;   // 3
+    let team_chunk_account = next_account_info(accounts_iter)?;  // 4
+    let token_mint = next_account_info(accounts_iter)?;          // 5
+    let _system_program = next_account_info(accounts_iter)?;     // 6
+    
+    let remaining_accounts = accounts_iter.as_slice();
+    
+    // ==================== ПРОВЕРКИ ====================
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    
+    if team_account.owner != program_id || snapshot_account.owner != program_id {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+    
+    check_mint_decimals(token_mint)?;
+    
+    let team = Team::load(team_account)?;
+    
+    if team.immutable.leader != *payer.key {
+        return Err(WaterError::Unauthorized.into());
+    }
+    
+    // 🔓 Дверь уже проверена в team_operations.rs
+    
+    let mut snapshot = TeamTmpSnapshot::load(snapshot_account)?;
+    
+    if snapshot.team_leader != *payer.key {
+        return Err(WaterError::Unauthorized.into());
+    }
+    
+    if snapshot.is_complete {
+        return Err(WaterError::SnapshotAlreadyExists.into());
+    }
+    
+    if snapshot.is_rank_paid {
+        return Err(WaterError::BonusAlreadyClaimed.into());
+    }
+    
+    if page != snapshot.pages_processed {
+        msg!("♒~~~⚡~~~:INVALID_PAGE:expected={}:got={}", snapshot.pages_processed, page);
+        return Err(WaterError::InvalidPDA.into());
+    }
+    
+    let (expected_chunk_pda, _) = TeamChunk::find_chunk_pda(
+        program_id, &snapshot.team_leader, page
+    );
+    if team_chunk_account.key != &expected_chunk_pda {
+        return Err(WaterError::InvalidPDA.into());
+    }
+    
+    // ==================== ЗАГРУЗКА TEAM CHUNK ====================
+    let team_chunk = TeamChunk::load(team_chunk_account)?;
+    let members = team_chunk.get_all_members(team_chunk_account)?;
+    
+    // ==================== СБОР ДАННЫХ ====================
+    let mut page_contribution: u64 = 0;
+    let mut page_tokens: u64 = 0;
+    let mut page_member_count: u32 = 0;
+    let mut page_rank_counts = [0u32; MAX_TEAM_RANKS];
+    let mut page_leader_contribution: u64 = 0;
+    let mut processed_count = 0u32;
+    let mut skipped_count = 0u32;
+    
+    for member_pubkey in &members {
+        let (user_pda, _) = User::find_user_address(program_id, member_pubkey);
+        let user_account = match remaining_accounts.iter().find(|acc| acc.key == &user_pda) {
+            Some(acc) => acc,
+            None => { skipped_count += 1; continue; }
+        };
+        
+        let user_ata = get_associated_token_address(member_pubkey, token_mint.key);
+        let token_account = match remaining_accounts.iter().find(|acc| acc.key == &user_ata) {
+            Some(acc) => acc,
+            None => { skipped_count += 1; continue; }
+        };
+        
+        let (stake_pda, _) = PlayerStakeData::find_stake_data_address(program_id, member_pubkey);
+        let stake_account = match remaining_accounts.iter().find(|acc| acc.key == &stake_pda) {
+            Some(acc) => acc,
+            None => { skipped_count += 1; continue; }
+        };
+        
+        let user = match User::get_user(user_account, program_id) {
+            Ok(u) => u,
+            Err(_) => { skipped_count += 1; continue; }
+        };
+        
+        let total_tokens = get_total_token_balance(token_account, stake_account)?;
+        
+        page_contribution = page_contribution
+            .checked_add(user.team_contribution)
+            .ok_or(WaterError::InvalidRewardAmount)?;
+        page_tokens = page_tokens
+            .checked_add(total_tokens)
+            .ok_or(WaterError::InvalidRewardAmount)?;
+        page_member_count += 1;
+        
+        if (user.current_rank as usize) < MAX_TEAM_RANKS {
+            page_rank_counts[user.current_rank as usize] += 1;
+        }
+        
+        if *member_pubkey == snapshot.team_leader {
+            page_leader_contribution = user.team_contribution;
+        }
+        
+        processed_count += 1;
+    }
+    
+    // ==================== АККУМУЛЯЦИЯ ====================
+    snapshot.add_page_data(
+        page_contribution, page_tokens, page_member_count,
+        &page_rank_counts, page_leader_contribution,
+    )?;
+    snapshot.save(snapshot_account)?;
+    
+    msg!("♒~~~🌊🌊🌊~~~:RECALC_PAGE:team={}:page={}:of={}:processed={}:skipped={}:contrib={}:tokens={}",
+        snapshot.team_leader, page + 1, snapshot.pages_total,
+        processed_count, skipped_count, page_contribution, page_tokens);
+    
+    Ok(())
+}
+
+// ==================== ТРАНЗАКЦИЯ 2: ПРОВЕРКА РАНГА (БЕЗ КОМИССИИ) ====================
+
+/// Аккаунты:
+/// 0. [signer] payer
+/// 1. [] team_account
+/// 2. [] snapshot_account
+/// 3. [] team_rank_config
+/// 4. [] token_mint
+pub fn finalize_recalculation(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    
+    let payer = next_account_info(accounts_iter)?;
+    let team_account = next_account_info(accounts_iter)?;
+    let snapshot_account = next_account_info(accounts_iter)?;
+    let team_rank_config_account = next_account_info(accounts_iter)?;
+    let token_mint = next_account_info(accounts_iter)?;
+    
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    
+    check_mint_decimals(token_mint)?;
+    
+    let team = Team::load(team_account)?;
+    if team.immutable.leader != *payer.key {
+        return Err(WaterError::Unauthorized.into());
+    }
+    
+    let snapshot = TeamTmpSnapshot::load(snapshot_account)?;
+    
+    if !snapshot.is_complete {
+        msg!("♒~~~⚡~~~:RECALC_NOT_COMPLETE:processed={}:total={}",
+            snapshot.pages_processed, snapshot.pages_total);
+        return Err(WaterError:: SnapshotNotFinalized.into());
+    }
+    
+    if snapshot.is_rank_paid {
+        return Err(WaterError::BonusAlreadyClaimed.into());
+    }
+    
+    let team_rank_config = TeamRankConfig::try_from_slice(&team_rank_config_account.data.borrow())
+        .map_err(|_| WaterError::SerializationError)?;
+    let acc = snapshot.get_accumulated_data();
+    let current_rank = team.mutable.current_rank;
+    
+    // Проверка повышения
+    let target_rank = current_rank + 1;
+    let mut can_upgrade = false;
+    let mut can_downgrade_to: Option<u8> = None;
+    
+    if (target_rank as usize) < team_rank_config.team_ranks.len() {
+        let req = &team_rank_config.team_ranks[target_rank as usize];
+        if req.is_active {
+            can_upgrade = check_requirements(&acc, req);
+        }
+    }
+    
+    // Проверка понижения
+    if !can_upgrade && current_rank > 0 {
+        let mut check_rank = current_rank;
+        while check_rank > 0 {
+            let req = &team_rank_config.team_ranks[check_rank as usize];
+            if req.is_active && check_requirements(&acc, req) {
+                break;
+            }
+            check_rank -= 1;
+        }
+        if check_rank < current_rank {
+            can_downgrade_to = Some(check_rank);
+        }
+    }
+    
+    // Лог результата
+    if can_upgrade {
+        let reward = team_rank_config.team_rank_rewards[target_rank as usize];
+        msg!("♒~~~🌊🌊🌊~~~:RANK_CHECK:team={}:current={}:can_upgrade=true:target={}:reward={}",
+            snapshot.team_leader, current_rank, target_rank, reward);
+    } else if let Some(downgrade_rank) = can_downgrade_to {
+        msg!("♒~~~🌊🌊🌊~~~:RANK_CHECK:team={}:current={}:can_downgrade=true:target={}",
+            snapshot.team_leader, current_rank, downgrade_rank);
+    } else {
+        msg!("♒~~~🌊🌊🌊~~~:RANK_CHECK:team={}:current={}:no_change=true",
+            snapshot.team_leader, current_rank);
+    }
+    
+    Ok(())
+}
+
+// ==================== ТРАНЗАКЦИЯ 3: ПРИМЕНЕНИЕ РАНГА (С КОМИССИЕЙ mode=2) ====================
+
+/// Аккаунты:
+/// 0. [signer] payer
+/// 1. [writable] team_account
+/// 2. [writable] snapshot_account
+/// 3. [] team_rank_config
+/// 4. [writable] bonus_fund_ata
+/// 5. [writable] team_token_ata
+/// 6. [] token_mint
+/// 7. [] token_program
+/// 8. [] immutable_seed_account
+/// 9. [writable] rent_pda          ← комиссия
+/// 10. [] system_program           ← комиссия
+/// 11. [writable] sol_fund         ← комиссия
+/// 12. [] root_pda_account         ← комиссия
+/// ... участники для снапшота (user_pda + token_ata + stake_data)
+pub fn apply_rank_change(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    new_rank: u8,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    
+    let payer = next_account_info(accounts_iter)?;                  // 0
+    let team_account = next_account_info(accounts_iter)?;           // 1
+    let snapshot_account = next_account_info(accounts_iter)?;       // 2
+    let team_rank_config_account = next_account_info(accounts_iter)?; // 3
+    let bonus_fund_ata = next_account_info(accounts_iter)?;         // 4
+    let team_token_ata = next_account_info(accounts_iter)?;         // 5
+    let token_mint = next_account_info(accounts_iter)?;             // 6
+    let token_program = next_account_info(accounts_iter)?;          // 7
+    let immutable_seed_account = next_account_info(accounts_iter)?; // 8
+    let rent_pda = next_account_info(accounts_iter)?;               // 9
+    let system_program = next_account_info(accounts_iter)?;         // 10
+    let sol_fund = next_account_info(accounts_iter)?;               // 11
+    let root_pda_account = next_account_info(accounts_iter)?;       // 12
+    
+    let member_accounts = accounts_iter.as_slice();
+    
+    // ==================== ПРОВЕРКИ ====================
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    
+    if team_account.owner != program_id || team_rank_config_account.owner != program_id {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+    
+    if *token_program.key != spl_token_2022_interface::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    
+    if rent_pda.owner != program_id {
+        return Err(WaterError::IllegalOwner.into());
+    }
+    
+    check_mint_decimals(token_mint)?;
+    
+    // Проверка SOL Fund
+    let root_pda = get_root_pda_key(program_id, root_pda_account)?;
+    let (expected_sol_fund, _) = derive_sol_fund_pda(program_id, &root_pda);
+    if sol_fund.key != &expected_sol_fund || sol_fund.owner != program_id {
+        return Err(WaterError::InvalidPDA.into());
+    }
+    
+    let root_pda_full = validate_root_pda_v2(program_id, immutable_seed_account)?;
+    let team_rank_config = TeamRankConfig::get_config(team_rank_config_account, program_id, &root_pda_full)?;
+    
+    check_team_pdas(
+        team_account, token_mint, team_token_ata,
+        bonus_fund_ata, &root_pda_full, program_id, payer.key
+    )?;
+    
+    // ==================== КОМИССИЯ (mode=2: Team + ATA + Snapshot) ====================
+    let rent = Rent::get()?;
+    let team_rent = rent.minimum_balance(Team::LEN);
+    let ata_rent = rent.minimum_balance(165);
+    let snapshot_rent = rent.minimum_balance(TeamTmpSnapshot::LEN);
+    
+    let commission = team_rent
+        .checked_add(ata_rent)
+        .and_then(|v| v.checked_add(snapshot_rent))
+        .ok_or(WaterError::InvalidTransfer)?;
+    
+    msg!("💰 Commission: {} lamports", commission);
+    
+    if **payer.try_borrow_lamports()? < commission {
+        return Err(WaterError::InsufficientBalance.into());
+    }
+    
+    invoke(
+        &system_instruction::transfer(payer.key, rent_pda.key, commission),
+        &[payer.clone(), rent_pda.clone(), system_program.clone()],
+    )?;
+    msg!("💰 PAID: {} lamports to shard", commission);
+    
+    return_surplus(rent_pda, sol_fund, &rent)?;
+    
+    // ==================== ЗАГРУЗКА ДАННЫХ ====================
+    let mut team = Team::load(team_account)?;
+    
+    let current_time = Clock::get()?.unix_timestamp;
+    let old_rank = team.mutable.current_rank;
+    
+    if team.is_bonus_claimed(new_rank) {
+        return Err(WaterError::BonusAlreadyClaimed.into());
+    }
+    
+    let mut snapshot = TeamTmpSnapshot::load(snapshot_account)?;
+    
+    if !snapshot.is_complete {
+        return Err(WaterError::SnapshotAlreadyExists.into());
+    }
+    
+    if snapshot.is_rank_paid {
+        return Err(WaterError::BonusAlreadyClaimed.into());
+    }
+    
+    let acc = snapshot.get_accumulated_data();
+    
+    // ==================== ПОВЫШЕНИЕ ====================
+    if new_rank > old_rank {
+        let req = &team_rank_config.team_ranks[new_rank as usize];
+        let reward_amount = team_rank_config.team_rank_rewards[new_rank as usize];
+        
+        if !check_requirements(&acc, req) {
+            return Err(WaterError::InvalidRank.into());
+        }
+        
+        // Расчет долей
+        let team_stake_hours = team.mutable.total_stake_hours;
+        let gap = team_stake_hours.saturating_sub(acc.total_contribution);
+        let leader_total = acc.leader_contribution.saturating_add(gap);
+        
+        let leader_tokens = if team_stake_hours > 0 {
+            (leader_total as u128 * reward_amount as u128 / team_stake_hours as u128) as u64
+        } else { 0 };
+        let team_tokens = reward_amount.saturating_sub(leader_tokens);
+        
+        let leader_pct = if reward_amount > 0 {
+            (leader_tokens as u128 * 10000 / reward_amount as u128) as u64
+        } else { 0 };
+        let team_pct = 10000u64.saturating_sub(leader_pct);
+        
+        let team_pool_contrib = acc.total_contribution.saturating_sub(acc.leader_contribution);
+        
+        // Выплата бонуса
+        if reward_amount > 0 {
+            let (expected_vault, vault_bump) = derive_bonus_fund_pda(program_id, &root_pda_full);
+            
+            if get_token_balance(bonus_fund_ata)? < reward_amount {
+                return Err(WaterError::InsufficientFunds.into());
+            }
+            
+            let transfer_ix = token_instruction::transfer_checked(
+                token_program.key, bonus_fund_ata.key, token_mint.key,
+                team_token_ata.key, &expected_vault, &[],
+                reward_amount, OUR_TOKEN_DECIMALS,
+            )?;
+            
+            let seeds = &[BONUS_FUND_SEED, root_pda_full.as_ref(), &[vault_bump]];
+            invoke_signed(&transfer_ix, &[
+                bonus_fund_ata.clone(), team_token_ata.clone(),
+                token_mint.clone(), token_program.clone(),
+            ], &[seeds])?;
+            
+            msg!("♒~~~🌊🌊🌊~~~:TEAM_PAID:team={}:rank={}:amount={}",
+                payer.key, new_rank, reward_amount);
+        }
+        
+        // Снапшот: Критерии
+        msg!("♒~~~🌊🌊🌊~~~:RANK_REQUIREMENTS_MET:team={}:target_rank={}:min_tokens={}:actual_tokens={}:min_stake={}:actual_stake={}:min_members={}:actual_members={}:required_ranks={:?}:actual_ranks={:?}",
+            payer.key, new_rank,
+            req.min_team_tokens, acc.total_tokens,
+            req.min_team_stake_hours, acc.total_contribution,
+            req.min_members, acc.member_count,
+            req.required_members, acc.rank_counts);
+        
+        // Снапшот: Заголовок
+        msg!("♒~~~🌊🌊🌊~~~:SNAPSHOT_HEADER:team={}:rank={}:reward={}:team_stake_hours={}:total_contrib={}:leader_contrib={}:gap={}:leader_pct={}:team_pct={}:leader_tokens={}:team_tokens={}:total_tokens={}:member_count={}",
+            payer.key, new_rank, reward_amount,
+            team_stake_hours, acc.total_contribution, acc.leader_contribution,
+            gap, leader_pct, team_pct, leader_tokens, team_tokens,
+            acc.total_tokens, acc.member_count);
+        
+        // Снапшот: Участники (БЕЗ ЛИДЕРА)
+        let mut leader_balance: u64 = 0;
+        let mut leader_staked: u64 = 0;
+        
+        for page in 0..snapshot.pages_total {
+            let (chunk_pda, _) = TeamChunk::find_chunk_pda(
+                program_id, &snapshot.team_leader, page
+            );
+            
+            if let Some(chunk_acc) = member_accounts.iter().find(|acc| acc.key == &chunk_pda) {
+                if let Ok(chunk) = TeamChunk::load(chunk_acc) {
+                    if let Ok(members) = chunk.get_all_members(chunk_acc) {
+                        for member_pubkey in &members {
+                            if *member_pubkey == snapshot.team_leader {
+                                let user_ata = get_associated_token_address(member_pubkey, token_mint.key);
+                                if let Some(ata) = member_accounts.iter().find(|acc| acc.key == &user_ata) {
+                                    leader_balance = get_token_balance(ata).unwrap_or(0);
+                                }
+                                let (stake_pda, _) = PlayerStakeData::find_stake_data_address(program_id, member_pubkey);
+                                if let Some(sa) = member_accounts.iter().find(|acc| acc.key == &stake_pda) {
+                                    leader_staked = get_staked_amount(sa).unwrap_or(0);
+                                }
+                                continue;
+                            }
+                            
+                            let (user_pda, _) = User::find_user_address(program_id, member_pubkey);
+                            let user_contrib = member_accounts.iter()
+                                .find(|acc| acc.key == &user_pda)
+                                .and_then(|ua| User::get_user(ua, program_id).ok())
+                                .map(|u| u.team_contribution)
+                                .unwrap_or(0);
+                            
+                            let user_ata = get_associated_token_address(member_pubkey, token_mint.key);
+                            let balance = member_accounts.iter()
+                                .find(|acc| acc.key == &user_ata)
+                                .and_then(|ata| get_token_balance(ata).ok())
+                                .unwrap_or(0);
+                            
+                            let (stake_pda, _) = PlayerStakeData::find_stake_data_address(program_id, member_pubkey);
+                            let staked = member_accounts.iter()
+                                .find(|acc| acc.key == &stake_pda)
+                                .and_then(|sa| get_staked_amount(sa).ok())
+                                .unwrap_or(0);
+                            
+                            let user_share = if team_pool_contrib > 0 {
+                                (user_contrib as u128 * team_tokens as u128 / team_pool_contrib as u128) as u64
+                            } else { 0 };
+                            
+                            msg!("♒~~~🌊🌊🌊~~~:SNAPSHOT_MEMBER:team={}:rank={}:user={}:contrib={}:balance={}:bonus_tokens={}",
+                                payer.key, new_rank, member_pubkey,
+                                user_contrib, balance + staked, user_share);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Лидер отдельно
+        msg!("♒~~~🌊🌊🌊~~~:SNAPSHOT_LEADER:team={}:rank={}:user={}:is_leader=true:contrib={}:balance={}:bonus_tokens={}",
+            payer.key, new_rank, snapshot.team_leader,
+            acc.leader_contribution, leader_balance + leader_staked, leader_tokens);
+        
+        // Обновление Team
+        team.mutable.current_rank = new_rank;
+        team.mutable.rank_bonuses_claimed[new_rank as usize] = true;
+        team.mutable.rank_bonuses_distributed[new_rank as usize] = false;
+        team.mutable.has_pending_distribution = true;
+        team.mutable.rank_epoch = team.mutable.rank_epoch.wrapping_add(1);
+        team.mutable.last_rank_update = current_time;
+        team.mutable.team_total_tokens = acc.total_tokens;
+        team.mutable.member_count = acc.member_count;
+        team.mutable.rank_member_counts = acc.rank_counts;
+        
+        team.save(team_account)?;
+        
+        // 🔥 Сохраняем доли для дистрибуции
+        snapshot.mark_paid_with_shares(leader_tokens, team_tokens);
+        snapshot.save(snapshot_account)?;
+        
+        msg!("♒~~~🌊🌊🌊~~~:RANK_UP:team={}:old={}:new={}:epoch={}",
+            payer.key, old_rank, new_rank, team.mutable.rank_epoch);
+    }
+    // ==================== ПОНИЖЕНИЕ ====================
+    else if new_rank < old_rank {
+        team.mutable.current_rank = new_rank;
+        team.mutable.last_rank_update = current_time;
+        team.mutable.team_total_tokens = acc.total_tokens;
+        team.mutable.member_count = acc.member_count;
+        team.mutable.rank_member_counts = acc.rank_counts;
+        
+        team.save(team_account)?;
+        
+        snapshot.mark_paid();
+        snapshot.save(snapshot_account)?;
+        
+        msg!("♒~~~🌊🌊🌊~~~:RANK_DOWN:team={}:old={}:new={}",
+            payer.key, old_rank, new_rank);
+    }
+    // ==================== БЕЗ ИЗМЕНЕНИЙ ====================
+    else {
+        team.save(team_account)?;
+        snapshot.save(snapshot_account)?;
+        
+        msg!("♒~~~🌊🌊🌊~~~:RANK_NO_CHANGE:team={}:rank={}",
+            payer.key, old_rank);
+    }
+    
+    // 🔥 НЕ закрываем дверь! (закрывается через sub_tag 254)
+    
+    msg!("♒~~~🌊🌊🌊~~~:RECALC_DONE:team={}:rank={}",
+        payer.key, team.mutable.current_rank);
+    
+    Ok(())
+}
+
+// ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+
+fn check_requirements(
+    acc: &crate::state::team_tmp_snapshot::RecalcAccumulatedData,
+    req: &TeamRankRequirements,
+) -> bool {
+    if acc.total_tokens < req.min_team_tokens { return false; }
+    if acc.total_contribution < req.min_team_stake_hours { return false; }
+    if acc.member_count < req.min_members as u32 { return false; }
+    
+    for i in 0..MAX_TEAM_RANKS {
+        if req.required_members[i] > 0 && acc.rank_counts[i] < req.required_members[i] as u32 {
+            return false;
+        }
+    }
+    true
+}
+
+fn check_mint_decimals(token_mint: &AccountInfo) -> Result<(), ProgramError> {
+    let mint_data = token_mint.data.borrow();
+    let mint = StateWithExtensions::<Mint>::unpack(&mint_data)
+        .map_err(|_| WaterError::InvalidAccountData)?;
+    if mint.base.decimals != OUR_TOKEN_DECIMALS {
+        return Err(WaterError::InvalidDecimals.into());
+    }
+    Ok(())
+}
+
+fn check_team_pdas(
+    team_account: &AccountInfo,
+    token_mint: &AccountInfo,
+    team_token_ata: &AccountInfo,
+    team_bonus_vault: &AccountInfo,
+    root_pda: &Pubkey,
+    program_id: &Pubkey,
+    leader: &Pubkey,
+) -> Result<(), ProgramError> {
+    let expected_team_ata = get_associated_token_address(team_account.key, token_mint.key);
+    if team_token_ata.key != &expected_team_ata {
+        return Err(WaterError::InvalidPDA.into());
+    }
+
+    let (expected_vault, _) = derive_bonus_fund_pda(program_id, root_pda);
+    let expected_bonus_ata = get_associated_token_address(&expected_vault, token_mint.key);
+    if team_bonus_vault.key != &expected_bonus_ata {
+        return Err(WaterError::InvalidPDA.into());
+    }
+
+    let (expected_team_pda, _) = derive_team_pda(program_id, leader);
+    if team_account.key != &expected_team_pda {
+        return Err(WaterError::InvalidPDA.into());
+    }
+
+    Ok(())
+}
+
+fn get_staked_amount(stake_data_account: &AccountInfo) -> Result<u64, ProgramError> {
+    let stake_data = PlayerStakeData::try_from_slice(&stake_data_account.data.borrow())
+        .map_err(|_| ProgramError::from(WaterError::SerializationError))?;
+    Ok(stake_data.active_stakes.iter().map(|s| s.amount).sum())
+}
+
+fn return_surplus(rent_pda: &AccountInfo, sol_fund: &AccountInfo, rent: &Rent) -> ProgramResult {
+    let shard_balance = **rent_pda.try_borrow_lamports()?;
+    let min_shard = rent.minimum_balance(rent_pda.data_len());
+    let target = min_shard.checked_mul(5).ok_or(WaterError::InvalidTransfer)?;
+    
+    if shard_balance > target {
+        let surplus = shard_balance - target;
+        **rent_pda.try_borrow_mut_lamports()? = target;
+        **sol_fund.try_borrow_mut_lamports()? = sol_fund.lamports()
+            .checked_add(surplus)
+            .ok_or(WaterError::InvalidTransfer)?;
+        msg!("💰 Surplus {} lamports returned to SOL Fund", surplus);
+    }
+    
+    Ok(())
+}=== SALE MOD ===
+// src/instructions/sale/mod.rs
+pub mod sale;
+
+pub use sale::process_buy_tokens_by_usd as process_purchase;
+=== SALE ===
+// src/instructions/sale/sale.rs — v3.1 FINAL (ВСЕ проверки + SPL Token + PDA автовывод)
+// 🔥 ПОЛНАЯ ВЕРСИЯ — всё из старого кода восстановлено + новый функционал
+use borsh::BorshSerialize;
+use crate::{
+    constants::*,
+    error::WaterError,
+    instructions::user::check_account_owner,
+    instructions::utils::get_associated_token_address,
+    instructions::utils::account_utils::get_token_balance,
+    params::sale::PurchaseTokensParams,
+    state::program_config::ProgramConfig,
+    state::config_trait::ConfigAccount,
+    state::sale::SaleConfig,
+    state::user::User,
+};
+use solana_program::{
+    program::invoke_signed,
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    msg,
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    sysvar::clock::Clock,
+    sysvar::Sysvar,
+};
+use spl_token_2022_interface::{
+    extension::StateWithExtensions,
+    state::Mint as Token2022Mint,
+    instruction as token_instruction,
+};
+use crate::instructions::utilits::pda::{get_root_pda_key, derive_config_pda_3, derive_token_fund_pda};
+
+/// Обработчик инструкции покупки токенов
+/// 
+/// Аккаунты:
+/// 0. [signer] user_wallet
+/// 1. [writable] user_account (User PDA)
+/// 2. [writable] sale_config_account
+/// 3. [] token_mint_account (WATER Mint)
+/// 4. [writable] usdt_token_account (ATA пользователя для WUSD)
+/// 5. [] stablecoin_mint (WUSD Mint)
+/// 6. [] fee_wallet (внешний кошелёк комиссии)
+/// 7. [writable] fee_wallet_usdt_ata
+/// 8. [writable] treasury_pda
+/// 9. [writable] treasury_usdt_ata
+/// 10. [] space_wallet (внешний кошелёк создателя) 🆕
+/// 11. [writable] space_wallet_usdt_ata 🆕
+/// 12. [] token_fund_pda
+/// 13. [writable] token_fund_ata
+/// 14. [writable] user_project_token_account (ATA пользователя для WATER)
+/// 15. [] token_program
+/// 16. [] associated_token_program
+/// 17. [] root_pda_account
+/// 18. [] program_config_account
+pub fn process_buy_tokens_by_usd(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    params: PurchaseTokensParams,
+) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+
+    // ========== ЧТЕНИЕ АККАУНТОВ ==========
+    let user_wallet = next_account_info(account_iter)?;               // 0
+    let user_account = next_account_info(account_iter)?;              // 1
+    let sale_config_account = next_account_info(account_iter)?;       // 2
+    let token_mint_account = next_account_info(account_iter)?;        // 3 WATER Mint
+    let usdt_token_account = next_account_info(account_iter)?;        // 4 ATA пользователя WUSD
+    let stablecoin_mint = next_account_info(account_iter)?;           // 5 WUSD Mint
+    let fee_wallet = next_account_info(account_iter)?;                // 6
+    let fee_wallet_usdt_ata = next_account_info(account_iter)?;       // 7
+    let treasury_pda = next_account_info(account_iter)?;              // 8
+    let treasury_usdt_ata = next_account_info(account_iter)?;         // 9
+    let space_wallet = next_account_info(account_iter)?;              // 10 🆕
+    let space_wallet_usdt_ata = next_account_info(account_iter)?;     // 11 🆕
+    let token_fund_pda = next_account_info(account_iter)?;            // 12
+    let token_fund_ata = next_account_info(account_iter)?;            // 13
+    let user_project_token_account = next_account_info(account_iter)?; // 14 ATA пользователя WATER
+    let token_program = next_account_info(account_iter)?;             // 15
+    let associated_token_program = next_account_info(account_iter)?;  // 16
+    let root_pda_account = next_account_info(account_iter)?;          // 17
+    let program_config_account = next_account_info(account_iter)?;    // 18
+
+    // ========== ПРОВЕРКА ПОДПИСАНТА ==========
+    if !user_wallet.is_signer {
+        msg!("❌ user_wallet должен быть подписантом!");
+        return Err(WaterError::Unauthorized.into());
+    }
+
+    // ========== ПОЛУЧАЕМ ROOT PDA ==========
+    let root_pda = get_root_pda_key(program_id, root_pda_account)?;
+
+    // ========== ДЕСЕРИАЛИЗУЕМ КОНФИГИ (ЗАГРУЖАЕМ ДО ПРОВЕРОК!) ==========
+    let program_config = ProgramConfig::get_config(program_config_account, program_id, &root_pda)?;
+    let mut sale_config = SaleConfig::get_config(sale_config_account, program_id, &root_pda)?;
+
+    // ========== ПРОВЕРКА ПРОГРАММ ==========
+    if token_program.key != &spl_token_2022_interface::id() 
+        && token_program.key != &sale_config.stablecoin_program {
+        msg!("❌ Неверная токен-программа!");
+        msg!("   Ожидалась: Token-2022 или {}", sale_config.stablecoin_program);
+        return Err(WaterError::InvalidTokenProgram.into());
+    }
+    if associated_token_program.key != &ASSOCIATED_TOKEN_PROGRAM_ID {
+        msg!("❌ Неверная ассоциированная токен-программа!");
+        return Err(WaterError::InvalidTokenProgram.into());
+    }
+
+    // ========== ПРОВЕРКИ ВЛАДЕЛЬЦЕВ ATA ==========
+    // WATER (Token-2022):
+    check_account_owner(token_mint_account, &spl_token_2022_interface::id())?;
+    check_account_owner(user_project_token_account, &spl_token_2022_interface::id())?;
+    check_account_owner(token_fund_ata, &spl_token_2022_interface::id())?;
+
+    // WUSD — проверяем через sale_config.stablecoin_program:
+    check_account_owner(usdt_token_account, &sale_config.stablecoin_program)?;
+    check_account_owner(fee_wallet_usdt_ata, &sale_config.stablecoin_program)?;
+    check_account_owner(treasury_usdt_ata, &sale_config.stablecoin_program)?;
+    check_account_owner(space_wallet_usdt_ata, &sale_config.stablecoin_program)?;
+    check_account_owner(stablecoin_mint, &sale_config.stablecoin_program)?;
+
+    // ========== ПРОВЕРКИ БИЗНЕС-ЛОГИКИ ==========
+    if !sale_config.has_active_stage() {
+        msg!("❌ Нет активной стадии продаж!");
+        return Err(WaterError::InvalidSaleStage.into());
+    }
+
+    if stablecoin_mint.key != &sale_config.stablecoin_mint {
+        msg!("❌ Неверный mint стабильной монеты!");
+        msg!("   Ожидался: {}", sale_config.stablecoin_mint);
+        msg!("   Получен: {}", stablecoin_mint.key);
+        return Err(WaterError::InvalidMint.into());
+    }
+
+    if !sale_config.is_active {
+        msg!("❌ Продажа не активна!");
+        return Err(WaterError::InvalidSaleStage.into());
+    }
+
+    if Clock::get()?.unix_timestamp < sale_config.start_time {
+        msg!("❌ Продажа ещё не началась!");
+        msg!("   Сейчас: {}, Старт: {}", Clock::get()?.unix_timestamp, sale_config.start_time);
+        return Err(WaterError::InvalidSaleStage.into());
+    }
+
+    // ========== ПРОВЕРКА СТАДИИ И ЦЕНЫ ==========
+    let current_stage_idx = sale_config.current_stage as usize;
+    if current_stage_idx >= sale_config.stages.len() {
+        msg!("❌ Неверный индекс стадии: {}!", current_stage_idx);
+        return Err(WaterError::InvalidSaleStage.into());
+    }
+    let stage = &sale_config.stages[current_stage_idx];
+
+    if stage.price_per_token == 0 {
+        msg!("❌ Цена токена не может быть 0!");
+        return Err(WaterError::InvalidPrice.into());
+    }
+
+    // ========== КОНСТАНТЫ DECIMALS ==========
+    const TOKEN_DECIMALS: u32 = 9;
+    const USDT_DECIMALS: u32 = 6;
+    let token_multiplier = 10u64.checked_pow(TOKEN_DECIMALS).ok_or(WaterError::MathOverflow)?;
+    let usdt_multiplier = 10u64.checked_pow(USDT_DECIMALS).ok_or(WaterError::MathOverflow)?;
+
+    // ========== РАСЧЁТ СУММ ==========
+    let total_amount = params.usdc_amount;
+    
+    if total_amount < MIN_DEPOSIT_SALE {
+        msg!("❌ Итоговая сумма {} lamports ({} USDC) меньше минимальной {} lamports ({} USDC)",
+            total_amount, total_amount / usdt_multiplier,
+            MIN_DEPOSIT_SALE, MIN_DEPOSIT_SALE / usdt_multiplier);
+        return Err(WaterError::DepositBelowMinimum.into());
+    }
+
+    const PERCENT_DENOMINATOR: u64 = 101;
+    const PERCENT_NUMERATOR: u64 = 100;
+    
+    let purchase_amount = total_amount
+        .checked_mul(PERCENT_NUMERATOR).ok_or(WaterError::MathOverflow)?
+        .checked_div(PERCENT_DENOMINATOR).ok_or(WaterError::MathOverflow)?;
+    let fee_amount = total_amount.checked_sub(purchase_amount).ok_or(WaterError::MathOverflow)?;
+
+    msg!("💰 Расчет комиссии (от итоговой суммы):");
+    msg!("   ИТОГО получено от пользователя: {} ({} USDC)", total_amount, total_amount / usdt_multiplier);
+    msg!("   Сумма покупки (без комиссии): {} ({} USDC)", purchase_amount, purchase_amount / usdt_multiplier);
+    msg!("   Комиссия 1%: {} ({} USDC)", fee_amount, fee_amount / usdt_multiplier);
+
+    // ========== ПРОВЕРКА БАЛАНСА WUSD ПОЛЬЗОВАТЕЛЯ ==========
+    let user_usdc_balance = get_token_balance(usdt_token_account)?;
+    if user_usdc_balance < total_amount {
+        msg!("❌ Недостаточно USDC: баланс {} USDC, требуется {} USDC",
+            user_usdc_balance / usdt_multiplier, total_amount / usdt_multiplier);
+        return Err(WaterError::InsufficientFunds.into());
+    }
+
+    // ========== ПРОВЕРКА ATA ПОЛЬЗОВАТЕЛЯ ДЛЯ WUSD ==========
+    let expected_user_usdt_ata = get_associated_token_address(user_wallet.key, stablecoin_mint.key);
+    if usdt_token_account.key != &expected_user_usdt_ata {
+        msg!("❌ Неверный USDT ATA пользователя!");
+        msg!("   Ожидался: {}", expected_user_usdt_ata);
+        msg!("   Получен: {}", usdt_token_account.key);
+        return Err(WaterError::InvalidAccountData.into());
+    }
+
+    // ========== ПРОВЕРКА PDA ПОЛЬЗОВАТЕЛЯ ==========
+    let (expected_user_pda, _user_pda_bump) =
+        Pubkey::find_program_address(&[b"user", user_wallet.key.as_ref()], program_id);
+    if user_account.key != &expected_user_pda {
+        msg!("❌ PDA пользователя не совпадает!");
+        msg!("   Ожидался: {}", expected_user_pda);
+        msg!("   Получен: {}", user_account.key);
+        return Err(WaterError::InvalidPDA.into());
+    }
+
+    if user_account.owner != program_id {
+        msg!("❌ PDA пользователя принадлежит другой программе!");
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    if user_account.data_is_empty() {
+        msg!("❌ PDA пользователя не инициализирован!");
+        return Err(WaterError::UserAccountNotFound.into());
+    }
+
+    let _user = User::get_user(user_account, program_id)?;
+
+    // ========== ПРОВЕРКА ATA ПОЛЬЗОВАТЕЛЯ ДЛЯ WATER ==========
+    let expected_user_token_ata = get_associated_token_address(user_account.key, token_mint_account.key);
+    
+    if user_project_token_account.key == user_account.key {
+        msg!("❌ КРИТИЧЕСКАЯ ОШИБКА: Передан PDA вместо ATA!");
+        return Err(WaterError::InvalidAccountData.into());
+    }
+    
+    if user_project_token_account.key == user_wallet.key {
+        msg!("❌ КРИТИЧЕСКАЯ ОШИБКА: Передан кошелек вместо ATA!");
+        return Err(WaterError::InvalidAccountData.into());
+    }
+    
+    if user_project_token_account.key != &expected_user_token_ata {
+        msg!("❌ Неверный ATA для токенов проекта!");
+        msg!("   Ожидался (от PDA): {}", expected_user_token_ata);
+        msg!("   Получен: {}", user_project_token_account.key);
+        return Err(WaterError::InvalidAccountData.into());
+    }
+
+    // ========== ПРОВЕРКА ВНЕШНИХ КОШЕЛЬКОВ ИЗ PROGRAM_CONFIG ==========
+    if fee_wallet.key != &program_config.fee_sale {
+        msg!("❌ Неверный fee_sale кошелек!");
+        msg!("   Ожидаемый: {}", program_config.fee_sale);
+        msg!("   Получен: {}", fee_wallet.key);
+        return Err(WaterError::InvalidAccountData.into());
+    }
+
+    if space_wallet.key != &program_config.space_wallet {
+        msg!("❌ Неверный space_wallet кошелёк!");
+        msg!("   Ожидаемый: {}", program_config.space_wallet);
+        msg!("   Получен: {}", space_wallet.key);
+        return Err(WaterError::InvalidAccountData.into());
+    }
+
+    // ========== ПРОВЕРКА ATA ВНЕШНИХ КОШЕЛЬКОВ ==========
+    let expected_fee_ata = get_associated_token_address(&program_config.fee_sale, stablecoin_mint.key);
+    if fee_wallet_usdt_ata.key != &expected_fee_ata {
+        msg!("❌ Неверный ATA для fee_sale");
+        msg!("   Ожидался: {}", expected_fee_ata);
+        msg!("   Получен: {}", fee_wallet_usdt_ata.key);
+        return Err(WaterError::InvalidAccountData.into());
+    }
+
+    let expected_space_ata = get_associated_token_address(&program_config.space_wallet, stablecoin_mint.key);
+    if space_wallet_usdt_ata.key != &expected_space_ata {
+        msg!("❌ Неверный ATA для space_wallet");
+        msg!("   Ожидался: {}", expected_space_ata);
+        msg!("   Получен: {}", space_wallet_usdt_ata.key);
+        return Err(WaterError::InvalidAccountData.into());
+    }
+
+    // ========== ПРОВЕРКА ATA TREASURY ==========
+    let expected_treasury_ata = get_associated_token_address(treasury_pda.key, stablecoin_mint.key);
+    if treasury_usdt_ata.key != &expected_treasury_ata {
+        msg!("❌ Неверный ATA для treasury");
+        msg!("   Ожидался: {}", expected_treasury_ata);
+        msg!("   Получен: {}", treasury_usdt_ata.key);
+        return Err(WaterError::InvalidAccountData.into());
+    }
+
+    // ========== ПРОВЕРКА TOKEN_FUND ==========
+    let (expected_token_fund, _expected_token_fund_bump) = 
+        derive_config_pda_3(program_id, TOKEN_FUND_SEED, &root_pda)?;
+    
+    if token_fund_pda.key != &expected_token_fund {
+        msg!("❌ НЕПРАВИЛЬНЫЙ TOKEN_FUND_PDA!");
+        msg!("   Ожидался: {}", expected_token_fund);
+        msg!("   Получен: {}", token_fund_pda.key);
+        return Err(WaterError::InvalidPDA.into());
+    }
+    
+    if token_fund_pda.owner != program_id {
+        msg!("❌ TOKEN_FUND_PDA принадлежит другой программе!");
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    let expected_token_fund_ata = get_associated_token_address(token_fund_pda.key, token_mint_account.key);
+    
+    if token_fund_ata.key != &expected_token_fund_ata {
+        msg!("❌ НЕПРАВИЛЬНЫЙ TOKEN_FUND_ATA!");
+        msg!("   Ожидался: {}", expected_token_fund_ata);
+        msg!("   Получен: {}", token_fund_ata.key);
+        return Err(WaterError::InvalidAccountData.into());
+    }
+    
+    if token_fund_ata.owner != token_program.key {
+        msg!("❌ TOKEN_FUND_ATA не принадлежит токен-программе!");
+        return Err(WaterError::InvalidAccountData.into());
+    }
+
+    // ========== ПРОВЕРКА MINT WATER ==========
+    let mint_data = token_mint_account.try_borrow_data()?;
+    let mint = StateWithExtensions::<Token2022Mint>::unpack(&mint_data)
+        .map_err(|_| WaterError::InvalidAccountData)?;
+    let mint_decimals = mint.base.decimals;
+    
+    if u32::from(mint_decimals) != TOKEN_DECIMALS {
+        msg!("❌ НЕСООТВЕТСТВИЕ DECIMALS!");
+        msg!("   mint decimals: {} (фактическое)", mint_decimals);
+        msg!("   константа token_decimals: {} (ожидаемое)", TOKEN_DECIMALS);
+        return Err(WaterError::InvalidAccountData.into());
+    }
+
+    // ========== РАСЧЕТ КОЛИЧЕСТВА ТОКЕНОВ WATER ==========
+    let amount_of_tokens = purchase_amount
+        .checked_mul(token_multiplier).ok_or(WaterError::MathOverflow)?
+        .checked_div(stage.price_per_token).ok_or(WaterError::MathOverflow)?;
+
+    if amount_of_tokens == 0 {
+        msg!("❌ Слишком маленькая сумма для покупки (0 токенов)");
+        return Err(WaterError::InvalidMinDeposit.into());
+    }
+
+    let token_lamports = amount_of_tokens;
+
+    // ========== ПРОВЕРКА НАЛИЧИЯ ТОКЕНОВ В КОНФИГЕ ==========
+    if amount_of_tokens > sale_config.remaining_tokens {
+        msg!("❌ Недостаточно токенов: запрошено {}, доступно {}",
+            amount_of_tokens, sale_config.remaining_tokens);
+        return Err(WaterError::NoTokensAvailable.into());
+    }
+
+    // ========== ПРОВЕРКА БАЛАНСА ФОНДА ==========
+    let fund_balance = get_token_balance(token_fund_ata)?;
+    
+    if fund_balance == 0 {
+        msg!("❌ ТОКЕН-ФОНД ПУСТ!");
+        return Err(WaterError::InsufficientFunds.into());
+    }
+    
+    if fund_balance < token_lamports {
+        msg!("❌ НЕДОСТАТОЧНО ТОКЕНОВ В ФОНДЕ!");
+        msg!("   Баланс: {}, требуется: {}", fund_balance, token_lamports);
+        return Err(WaterError::InsufficientFunds.into());
+    }
+
+    // ========== ПРОВЕРКА ЧТО ФОНД НЕ ПЕРЕВОДИТ САМ СЕБЕ ==========
+    if token_fund_ata.key == user_project_token_account.key {
+        msg!("❌ Фонд не может переводить токены сам себе!");
+        return Err(WaterError::InvalidTransfer.into());
+    }
+
+    // ========== СОХРАНЯЕМ СНАПШОТ СОСТОЯНИЯ ==========
+    let _old_remaining = sale_config.remaining_tokens;
+    let _old_sold = sale_config.sold_tokens;
+    let _old_fees = sale_config.total_fees_collected;
+    let _old_pda = sale_config.pda_balance;
+
+    // ========== ОБНОВЛЯЕМ СОСТОЯНИЕ ==========
+    sale_config.remaining_tokens = sale_config.remaining_tokens
+        .checked_sub(amount_of_tokens).ok_or(WaterError::MathOverflow)?;
+    
+    sale_config.sold_tokens = sale_config.sold_tokens
+        .checked_add(amount_of_tokens).ok_or(WaterError::MathOverflow)?;
+    
+    sale_config.total_fees_collected = sale_config.total_fees_collected
+        .checked_add(fee_amount).ok_or(WaterError::MathOverflow)?;
+    
+    sale_config.pda_balance = sale_config.pda_balance
+        .checked_add(purchase_amount).ok_or(WaterError::MathOverflow)?;
+    
+    sale_config.last_updated = Clock::get()?.unix_timestamp;
+
+    // 🔥 АВТОВЫВОД ИЗЛИШКОВ НА SPACE_WALLET (PDA подписывает через invoke_signed)
+    sale_config.check_and_withdraw_excess(
+        treasury_pda, space_wallet, stablecoin_mint,
+        program_config_account, program_id, &root_pda,
+    )?;
+
+    // ========== СЕРИАЛИЗУЕМ ОБНОВЛЕННЫЙ SALE_CONFIG ==========
+    sale_config.serialize(&mut *sale_config_account.data.borrow_mut())
+        .map_err(|_| WaterError::SerializationError)?;
+
+    // ========== ПЕРЕВОДЫ WUSD (пользователь подписывает) ==========
+    
+    // 1. Комиссия → fee_wallet
+    transfer_tokens_direct(
+        usdt_token_account, fee_wallet_usdt_ata, stablecoin_mint,
+        fee_amount, user_wallet,
+    )?;
+    msg!("  ✅ Комиссия {} USDC переведена на fee_wallet", fee_amount / usdt_multiplier);
+
+    // 2. Чистая сумма → treasury
+    transfer_tokens_direct(
+        usdt_token_account, treasury_usdt_ata, stablecoin_mint,
+        purchase_amount, user_wallet,
+    )?;
+    msg!("  ✅ Сумма покупки {} USDC переведена в treasury", purchase_amount / usdt_multiplier);
+
+    // ========== ПЕРЕВОД WATER ПОЛЬЗОВАТЕЛЮ (PDA подписывает) ==========
+    msg!("  ♒~~~~~~💧: Перевод {} токенов пользователю на ATA", amount_of_tokens / token_multiplier);
+    msg!("     ATA адрес: {}", user_project_token_account.key);
+
+    let (_token_fund_pda_calc, bump) = derive_token_fund_pda(program_id, &root_pda)?;
+
+    if _token_fund_pda_calc != *token_fund_pda.key {
+        msg!("❌ НЕСООТВЕТСТВИЕ PDA!");
+        return Err(WaterError::InvalidPDA.into());
+    }
+
+    let transfer_ix = token_instruction::transfer_checked(
+        token_program.key,
+        token_fund_ata.key,
+        token_mint_account.key,
+        user_project_token_account.key,
+        token_fund_pda.key,
+        &[],
+        token_lamports,
+        mint_decimals,
+    ).map_err(|_| WaterError::InvalidTransfer)?;
+
+    invoke_signed(
+        &transfer_ix,
+        &[
+            token_fund_ata.clone(),
+            token_mint_account.clone(),
+            user_project_token_account.clone(),
+            token_fund_pda.clone(),
+            token_program.clone(),
+        ],
+        &[&[TOKEN_FUND_SEED, root_pda.as_ref(), &[0u8], &[bump]]],
+    )?;
+        
+    msg!("  ✅ {} токенов переведены пользователю", amount_of_tokens / token_multiplier);
+
+    // ========== ОБНОВЛЕНИЕ ПОЛЬЗОВАТЕЛЯ ==========
+    let mut user = User::get_user(user_account, program_id)?;
+    user.buy_token_balance = user.buy_token_balance
+        .checked_add(amount_of_tokens).ok_or(WaterError::MathOverflow)?;
+    
+    user.serialize(&mut *user_account.data.borrow_mut())?;
+
+    // ========== ПЕРЕХОД НА СЛЕДУЮЩУЮ СТАДИЮ ==========
+    if sale_config.remaining_tokens == 0 {
+        if sale_config.current_stage < (MAX_SALE_STAGES - 1) as u8 {
+            let next_stage = sale_config.current_stage.checked_add(1).ok_or(WaterError::MathOverflow)?;
+            
+            sale_config.current_stage = next_stage;
+            sale_config.remaining_tokens = sale_config.stages[next_stage as usize].tokens_available;
+            
+            sale_config.serialize(&mut *sale_config_account.data.borrow_mut())
+                .map_err(|_| WaterError::SerializationError)?;
+            
+            msg!("➡️ Переход на стадию {}", sale_config.current_stage);
+        } else {
+            sale_config.is_active = false;
+            sale_config.serialize(&mut *sale_config_account.data.borrow_mut())
+                .map_err(|_| WaterError::SerializationError)?;
+            
+            msg!("🏁 Все стадии продаж завершены");
+        }
+    }
+
+    msg!("✅ УСПЕШНАЯ ПОКУПКА: {} токенов за {} USDC (комиссия: {} USDC, итого: {} USDC)",
+        amount_of_tokens / token_multiplier,
+        purchase_amount / usdt_multiplier,
+        fee_amount / usdt_multiplier,
+        total_amount / usdt_multiplier
+    );
+
+    Ok(())
+}
+
+// ==================== ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ====================
+
+/// Прямой перевод токенов (authority — signer)
+fn transfer_tokens_direct<'a>(
+    source: &AccountInfo<'a>,
+    destination: &AccountInfo<'a>,
+    mint_account: &AccountInfo<'a>,
+    amount: u64,
+    authority: &AccountInfo<'a>,
+) -> ProgramResult {
+    use solana_program::program::invoke;
+    
+    let token_program_id = mint_account.owner;
+    
+    let mint_data = mint_account.data.borrow();
+    let mint = StateWithExtensions::<Token2022Mint>::unpack(&mint_data)
+        .map_err(|_| WaterError::InvalidAccountData)?;
+    let decimals = mint.base.decimals;
+
+    let transfer_ix = token_instruction::transfer_checked(
+        token_program_id,
+        source.key,
+        mint_account.key,
+        destination.key,
+        authority.key,
+        &[],
+        amount,
+        decimals,
+    ).map_err(|_| WaterError::InvalidTransfer)?;
+
+    invoke(
+        &transfer_ix,
+        &[source.clone(), destination.clone(), mint_account.clone(), authority.clone()],
+    )?;
+
+    Ok(())
+}

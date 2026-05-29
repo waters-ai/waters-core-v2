@@ -1,0 +1,51 @@
+{
+  "schema_version": "1.0",
+  "model": "democratic",
+  "name": "Демократическая модель HiveMind",
+  "description": "Модель управления через голосование. Решение принимается большинством голосов агентов.",
+  "layers": {
+    "IV": {
+      "name": "Дух / Проклятие",
+      "function": "Верховный этический запрет",
+      "constraints": ["Не навреди", "Воля большинства", "Права меньшинства"]
+    },
+    "III": {
+      "name": "Приказ / Воля",
+      "function": "Стратегия и принятие решений",
+      "roles": ["Супервизор Роя"],
+      "behavior": "representative"
+    },
+    "II": {
+      "name": "Право / Контракт",
+      "function": "Тактика и распределение",
+      "roles": ["Избиратель", "Счётчик голосов"],
+      "behavior": "voting"
+    },
+    "I": {
+      "name": "Сеть / Дело",
+      "function": "Исполнение и связь (DTN)",
+      "roles": ["Агент-избиратель"],
+      "behavior": "participatory"
+    }
+  },
+  "flow": {
+    "proposal": "II -> I",
+    "voting": "I -> II (голосование)",
+    "decision": "II -> III (решение большинства)",
+    "execution": "III -> I"
+  },
+  "voting_rules": {
+    "quorum": "51%",
+    "majority": "simple_majority",
+    "veto": "Слой IV (этическое вето)"
+  },
+  "use_cases": ["управление колонией", "распределение общих ресурсов"],
+  "dtn_delays": {
+    "earth_moon": "2.5s",
+    "earth_mars": "5-20m"
+  },
+  "economy": {
+    "token": "FFF",
+    "purpose": "защита от спама и оплата участия в голосовании"
+  }
+}

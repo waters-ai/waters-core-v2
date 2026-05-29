@@ -1,0 +1,13 @@
+{
+  "taps": [
+    "github.com/waters-ai/mcp-skills",
+    "huggingface.co/skills"
+  ],
+  "installed": [
+    "general",
+    "explorer",
+    "scout-ru",
+    "scout-us",
+    "scout-cn"
+  ]
+}

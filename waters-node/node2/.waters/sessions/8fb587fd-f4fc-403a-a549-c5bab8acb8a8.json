@@ -1,0 +1,10 @@
+{
+  "session_id": "8fb587fd-f4fc-403a-a549-c5bab8acb8a8",
+  "node_id": "c30dc426e629f0ee1a1af64eb8e5a3b7559c20d52abeb1e44a0354e3fed5ac24",
+  "mission_id": "Работа-wate",
+  "started_at": "2026-05-28T06:49:30.987490047+00:00",
+  "updated_at": "2026-05-28T06:49:30.987490047+00:00",
+  "turn_count": 0,
+  "system_prompt": "You are the WATERS Node interface. Help the user.",
+  "history": []
+}

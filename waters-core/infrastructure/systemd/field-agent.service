@@ -1,0 +1,24 @@
+[Unit]
+Description=WATERS Field Agent (Scout) v2.0 — DMZ information gatherer
+Documentation=https://github.com/waters-ai/waters-core
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/WATERS/repos/waters-core
+ExecStart=/usr/bin/python3 /home/ubuntu/WATERS/repos/waters-core/agents/field_agent.py
+Restart=always
+RestartSec=10
+WatchdogSec=60
+StandardOutput=append:/home/waters-data/logs/field_agent.log
+StandardError=append:/home/waters-data/logs/field_agent.log
+
+Environment=WATERS_TELEGRAM_TOKEN_FILE=%h/.secrets/.secret_telegram_token
+Environment=WATERS_YANDEX_API_KEY_FILE=%h/.secrets/.secret_yandex_api_key
+Environment=WATERS_YANDEX_USER_FILE=%h/.secrets/.secret_yandex_user
+
+[Install]
+WantedBy=multi-user.target

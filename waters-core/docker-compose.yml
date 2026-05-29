@@ -1,0 +1,271 @@
+# WATERS Platform — Базовый сценарий (Фаза 0)
+# С DMZ-зоной для внешних запросов
+#
+# Сети:
+#   waters-internal — внутренняя сеть агентов (без доступа в интернет)
+#   waters-dmz      — DMZ-зона (MCP-прокси, доступ к интернету)
+#
+# Удалённый сервер:
+#   Хост: 171.22.180.238 (Перекрёсток-1)
+#   Назначение: Kafka (брокер), Redis для карусели агентов
+#   Подключение: через переменные окружения REMOTE_*
+#     REMOTE_KAFKA_BOOTSTRAP=171.22.180.238:9092
+#     REMOTE_REDIS_HOST=171.22.180.238
+#     REMOTE_REDIS_PORT=6379
+#
+# Запуск с удалённым сервером:
+#   export REMOTE_KAFKA_BOOTSTRAP=171.22.180.238:9092
+#   docker compose up -d
+#
+# Локальный запуск (без удалёнки):
+#   docker compose up -d
+#
+
+services:
+  # ═══════════════════════════════════════════
+  # БРОКЕР СООБЩЕНИЙ (Kafka — единая шина)
+  # ═══════════════════════════════════════════
+  kafka:
+    image: apache/kafka:4.0.0
+    container_name: waters-kafka
+    ports:
+      - "9092:9092"                         # EXTERNAL listener — для миссионного сервера
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    environment:
+      # KRaft mode (без Zookeeper)
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_NODE_ID: "1"
+      CLUSTER_ID: "waters-platform"
+
+      # Два listener'а: INTERNAL (Docker) + EXTERNAL (удалённые клиенты)
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9091,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://waters-kafka:9091,EXTERNAL://171.22.180.238:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@waters-kafka:9093"
+
+      # Хранилище
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+
+      # Топики
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_NUM_PARTITIONS: "3"
+      KAFKA_MESSAGE_MAX_BYTES: "10485760"   # 10MB — для больших findings
+    networks:
+      - waters-internal
+      - waters-dmz
+    healthcheck:
+      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ═══════════════════════════════════════════
+  # КЭШ (Redis)
+  # ═══════════════════════════════════════════
+  redis:
+    image: redis:7-alpine
+    container_name: waters-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    networks:
+      - waters-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ═══════════════════════════════════════════
+  # ВЕКТОРНАЯ БД (ChromaDB)
+  # ═══════════════════════════════════════════
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: waters-chroma
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+    environment:
+      ALLOW_RESET: "true"
+      IS_PERSISTENT: "true"
+    networks:
+      - waters-internal
+      - waters-dmz
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8000 && echo -e 'GET /api/v2/heartbeat HTTP/1.0\r\n\r\n' >&3 && timeout 3 cat <&3 | grep -qi nanosecond"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # ═══════════════════════════════════════════
+  # СТРУКТУРНАЯ БД (CozoDB) — временно отключена (image не существует)
+  # ═══════════════════════════════════════════
+  # cozodb:
+  #   image: cozodb/cozo:latest
+  #   container_name: waters-cozo
+  #   ports:
+  #     - "9070:9070"
+  #   volumes:
+  #     - cozo-data:/data
+  #   networks:
+  #     - waters-internal
+
+  # ═══════════════════════════════════════════
+  # MCP-ПРОКСИ (DMZ-зона)
+  # Единственный шлюз во внешний интернет
+  # ═══════════════════════════════════════════
+  mcp-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: waters-mcp-proxy
+    ports:
+      - "8080:8080"
+    environment:
+      REDIS_HOST: waters-redis
+      REDIS_PORT: "6379"
+      CHROMA_HOST: waters-chroma
+      CHROMA_PORT: "8000"
+      KAFKA_BOOTSTRAP: waters-kafka:9091
+      REMOTE_KAFKA_BOOTSTRAP: "${REMOTE_KAFKA_BOOTSTRAP:-}"
+      REMOTE_REDIS_HOST: "${REMOTE_REDIS_HOST:-}"
+      REMOTE_REDIS_PORT: "${REMOTE_REDIS_PORT:-6379}"
+    networks:
+      - waters-internal
+      - waters-dmz
+    depends_on:
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ═══════════════════════════════════════════
+  # NGINX — обратный прокси для DMZ
+  # ═══════════════════════════════════════════
+  nginx:
+    image: nginx:alpine
+    container_name: waters-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - waters-dmz
+    depends_on:
+      - mcp-proxy
+    restart: unless-stopped
+
+  # ══════════════════════════════════════════
+  # BRAVE SEARCH (DMZ-зона)
+  # ══════════════════════════════════════════
+  brave-search:
+    build:
+      context: ./scripts
+      dockerfile: Dockerfile.brave-search
+    container_name: waters-brave-search
+    restart: unless-stopped
+    networks:
+      - waters-internal
+      - waters-dmz
+    ports:
+      - "8081:8081"
+    environment:
+      - BRAVE_API_KEY=${BRAVE_API_KEY:-}
+      - REDIS_HOST=redis-dmz
+      - REDIS_PORT=6380
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      - KAFKA_BROKER=waters-kafka:9091
+      - REMOTE_KAFKA_BOOTSTRAP=${REMOTE_KAFKA_BOOTSTRAP:-}
+      - REMOTE_REDIS_HOST=${REMOTE_REDIS_HOST:-}
+      - REMOTE_REDIS_PORT=${REMOTE_REDIS_PORT:-6379}
+    volumes:
+      - ./scripts:/app/scripts
+    depends_on:
+      - mcp-proxy
+      - kafka
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ══════════════════════════════════════════
+  # REDIS (DMZ-зона, изолированный)
+  # ══════════════════════════════════════════
+  redis-dmz:
+    image: redis:7-alpine
+    container_name: waters-redis-dmz
+    restart: unless-stopped
+    networks:
+      - waters-dmz
+    ports:
+      - "6380:6380"
+    command: redis-server --port 6380 --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-dmz-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6380", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ══════════════════════════════════════════
+  # CHROMADB (DMZ-зона, read-only)
+  # ══════════════════════════════════════════
+  chromadb-dmz:
+    image: chromadb/chroma:latest
+    container_name: waters-chroma-dmz
+    restart: unless-stopped
+    networks:
+      - waters-dmz
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma-dmz-data:/chroma/chroma
+    environment:
+      - ALLOW_RESET=false
+      - IS_PERSISTENT=true
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8000 && echo -e 'GET /api/v2/heartbeat HTTP/1.0\r\n\r\n' >&3 && timeout 3 cat <&3 | grep -qi nanosecond"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+networks:
+  waters-internal:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+  waters-dmz:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
+
+volumes:
+  kafka-data:
+  redis-data:
+  chroma-data:
+  redis-dmz-data:
+  chroma-dmz-data:
+  cozo-data:

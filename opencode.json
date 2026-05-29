@@ -1,0 +1,102 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "deepseek": {
+      "name": "DeepSeek (WATERS Primary)",
+      "apiKey": "{env:DEEPSEEK_API_KEY}",
+      "models": {
+        "deepseek-v4-flash": {
+          "name": "DeepSeek V4 Flash"
+        }
+      }
+    },
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (local)",
+      "options": {
+        "baseURL": "http://localhost:11434/v1",
+        "timeout": false,
+        "chunkTimeout": 120000
+      },
+      "models": {
+        "qwen2.5:3b": {
+          "name": "Qwen 2.5 3B"
+        },
+        "qwen2.5:7b": {
+          "name": "Qwen 2.5 7B (CPU)",
+          "options": {
+            "keep_alive": "10m"
+          }
+        },
+        "qwen2.5:14b": {
+          "name": "Qwen 2.5 14B"
+        }
+      }
+    }
+  },
+  "model": "ollama/qwen2.5:7b",
+  "formatter": {
+    "prettier": {
+      "disabled": false
+    },
+    "ruff": {
+      "disabled": false
+    }
+  },
+  "server": {
+    "port": 4096,
+    "hostname": "0.0.0.0",
+    "mdns": true
+  },
+  "permission": {
+    "edit": "allow",
+    "bash": "ask",
+    "read": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "webfetch": "allow",
+    "task": "allow",
+    "skill": "allow"
+  },
+  "mcp": {
+    "filesystem": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/home/ubuntu/WATERS/repos/waters-core"
+      ],
+      "enabled": true
+    },
+    "github": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-github"
+      ],
+      "enabled": true,
+      "environment": {
+        "GITHUB_TOKEN": "{env:GITHUB_TOKEN}"
+      }
+    },
+    "memory": {
+      "type": "local",
+      "command": [
+        "python3",
+        "/home/ubuntu/WATERS/repos/waters-core/scripts/mcp_memory_bridge.py"
+      ],
+      "enabled": true
+    },
+    "space": {
+      "type": "local",
+      "command": [
+        "python3",
+        "/home/ubuntu/WATERS/repos/waters-core/scripts/mcp_space_bridge.py"
+      ],
+      "enabled": true,
+      "timeout": 60000
+    }
+  }
+}

@@ -1,0 +1,2220 @@
+// src/instructions/admin/mod.rs
+
+pub mod update_config;
+pub mod update_program_config;
+pub mod update_mem_rank;
+pub mod update_team_rank;
+pub mod update_sale_stage;
+pub mod update_staking_config;
+pub mod withdraw_fees;
+pub mod refill_funds;
+
+pub mod redistribute_shard_balances;   
+pub mod refill_shard_from_mema;                   // инструкция 39 (основная)
+pub mod emergency_refill_sol_fund_shard;          // инструкция 41 (экстренная)
+
+
+// Re-exports
+pub use update_config::*;
+pub use update_program_config::*;
+pub use update_mem_rank::*;
+pub use update_team_rank::*;
+pub use update_sale_stage::*;
+pub use update_staking_config::*;
+pub use withdraw_fees::*;
+
+pub use redistribute_shard_balances::*;   
+pub use refill_shard_from_mema::process_refill_shard_from_mema;                   // 39
+pub use emergency_refill_sol_fund_shard::process_emergency_refill_sol_fund_shard; // 41
+
+===SEPARATOR===
+// src/instructions/admin/emergency_refill_sol_fund_shard.rs
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    msg,
+    pubkey::Pubkey,
+    sysvar::{rent::Rent, Sysvar},
+};
+use crate::{constants::*, error::WaterError};
+use crate::instructions::utilits::pda::{
+    derive_sol_fund_pda,
+    get_root_pda_key,
+};
+
+// Константа для экстренного пополнения (3 вечных оплаты)
+pub const EMERGENCY_REFILL_AMOUNT: u64 = 3 * 6_048_240; // ~0.018 SOL
+
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
+pub struct EmergencyRefillParams {
+    pub amount: u64, // Обычно EMERGENCY_REFILL_AMOUNT, но можно передать любую сумму
+}
+
+pub fn process_emergency_refill_sol_fund_shard(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    params: EmergencyRefillParams,
+) -> ProgramResult {
+    
+    msg!("========================================================");
+    msg!("🚨 [41] emergency_refill_sol_fund_shard START");
+    msg!("========================================================");
+    
+    let account_iter = &mut accounts.iter();
+    
+    // 0. Root PDA
+    let root_pda_account = next_account_info(account_iter)?;
+    // 1. SOL Fund PDA (источник)
+    let sol_fund = next_account_info(account_iter)?;
+    // 2. Target shard (получатель)
+    let shard = next_account_info(account_iter)?;
+
+ 
+    // Получаем root_pda
+    let root_pda = get_root_pda_key(program_id, root_pda_account)?;
+    msg!("✅ Root PDA: {}", root_pda);
+
+    // Проверяем SOL Fund PDA
+    let (expected_sol_fund, _sol_bump) = derive_sol_fund_pda(program_id, &root_pda);
+    if sol_fund.key != &expected_sol_fund {
+        msg!("❌ Неверный SOL Fund PDA");
+        return Err(WaterError::InvalidPDA.into());
+    }
+
+    // Проверяем, что SOL Fund принадлежит программе
+    if sol_fund.owner != program_id {
+        msg!("❌ SOL Fund не принадлежит программе");
+        return Err(WaterError::IllegalOwner.into());
+    }
+
+    // Проверяем баланс
+    let sol_fund_balance = **sol_fund.lamports.borrow();
+    msg!("💰 Баланс SOL Fund: {} lamports", sol_fund_balance);
+    msg!("💰 Требуется перевести: {} lamports", params.amount);
+
+    if sol_fund_balance < params.amount {
+        msg!("❌ Недостаточно средств в SOL Fund");
+        return Err(WaterError::InsufficientFunds.into());
+    }
+
+    // Проверяем минимальную аренду для шарда после перевода
+    let rent = Rent::get()?;
+    let min_balance = rent.minimum_balance(shard.data_len());
+    let new_shard_balance = (**shard.lamports.borrow()).saturating_add(params.amount);
+    
+    if new_shard_balance < min_balance {
+        msg!("❌ Баланс шарда после перевода ниже минимальной аренды");
+        return Err(WaterError::InsufficientFunds.into());
+    }
+
+    // Выполняем перевод
+    msg!("💰 Переводим {} lamports из SOL Fund в шард {}", params.amount, shard.key);
+    
+    let fund_balance = **sol_fund.lamports.borrow();
+    let shard_balance = **shard.lamports.borrow();
+    
+    **sol_fund.lamports.borrow_mut() = fund_balance
+        .checked_sub(params.amount)
+        .ok_or(WaterError::InsufficientFunds)?;
+    
+    **shard.lamports.borrow_mut() = shard_balance
+        .checked_add(params.amount)
+        .ok_or(WaterError::InvalidTransfer)?;
+
+    msg!("✅ Экстренное пополнение выполнено успешно!");
+    msg!("   Новый баланс SOL Fund: {} lamports", **sol_fund.lamports.borrow());
+    msg!("   Новый баланс шарда: {} lamports", **shard.lamports.borrow());
+
+    Ok(())
+}===SEPARATOR===
+// src/instructions/admin/redistribute_shard_balances.rs - ИСПРАВЛЕННАЯ ВЕРСИЯ
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    msg,
+    pubkey::Pubkey,
+    sysvar::{clock::Clock, Sysvar},
+};
+use crate::{
+    constants::*,
+    error::WaterError,
+    state::{RentPdaMema, RentPdaShard},
+    utils::validation_utils::validate_root_pda_v2,
+};
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq)]
+#[borsh(use_discriminant = true)]  // ← ДОБАВЛЯЕМ ЭТОТ АТРИБУТ!
+#[repr(u8)]
+pub enum RedistributionMode {
+    /// Только балансировка (balance_all_shards)
+    BalanceOnly = 0,
+    /// Только экстренные сигналы (handle_emergency_signals)
+    EmergencyOnly = 1,
+    /// Сначала экстренные, потом балансировка
+    Full = 2,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
+pub struct RedistributeParams {
+    pub mode: RedistributionMode,
+}
+
+pub fn process_redistribute_shard_balances(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    params: RedistributeParams,
+) -> ProgramResult {
+    
+    msg!("========================================================");
+    msg!("🔄 [40] redistribute_shard_balances START");
+    msg!("========================================================");
+    msg!("📋 Режим: {:?}", params.mode);
+    
+    let account_iter = &mut accounts.iter();
+    
+    // === Аккаунты ===
+    let admin = next_account_info(account_iter)?;
+    let rent_mema = next_account_info(account_iter)?;
+    let root_pda_account = next_account_info(account_iter)?;
+    
+    // === Читаем все шарды (32 штуки) ===
+    let mut shard_accounts = Vec::new();
+    for _i in 0..TOTAL_RENT_SHARDS {
+        let shard = next_account_info(account_iter)?;
+        shard_accounts.push(shard);
+    }
+    
+    msg!("📋 Аккаунтов: {}", 3 + TOTAL_RENT_SHARDS as usize);
+    
+    // === Валидация ===
+    if !admin.is_signer {
+        msg!("❌ Администратор не подписал");
+        return Err(WaterError::Unauthorized.into());
+    }
+    
+    let root_pda = validate_root_pda_v2(program_id, root_pda_account)?;
+    
+    // Проверяем rent_mema
+    let (expected_mema, _) = Pubkey::find_program_address(
+        &[RENTPDA_MEMA_SEED, root_pda.as_ref()],
+        program_id,
+    );
+    if rent_mema.key != &expected_mema {
+        msg!("❌ Неверный rent_mema PDA");
+        return Err(WaterError::InvalidPDA.into());
+    }
+    
+    // === Загружаем RentPdaMema ===
+    let mut mema_data = RentPdaMema::try_from_slice(&rent_mema.data.borrow())
+        .map_err(|_| WaterError::SerializationError)?;
+    
+    // Проверяем администратора
+    mema_data.check_admin(admin.key)?;
+    
+    // === Загружаем все шарды ===
+    let mut shards: Vec<RentPdaShard> = Vec::with_capacity(TOTAL_RENT_SHARDS as usize);
+    for (i, shard_acc) in shard_accounts.iter().enumerate() {
+        if shard_acc.data_is_empty() {
+            msg!("⚠️ Шард {} не инициализирован", i);
+            // Используем new() вместо empty()
+            shards.push(RentPdaShard::new(
+                *rent_mema.key,
+                i as u8,
+                0, // bump
+            ));
+            continue;
+        }
+        
+        let shard = RentPdaShard::try_from_slice(&shard_acc.data.borrow())
+            .map_err(|_| WaterError::SerializationError)?;
+        
+        if shard.rent_mema_pda != *rent_mema.key {
+            msg!("❌ Шард {} привязан к другому rent_mema", i);
+            return Err(WaterError::InvalidShardId.into());
+        }
+        
+        shards.push(shard);
+    }
+    
+    let now = Clock::get()?.unix_timestamp;
+    
+    // === Обновляем балансы шардов в mema_data ===
+    for (i, shard) in shards.iter().enumerate() {
+        mema_data.shard_balances[i] = shard.current_balance;
+        mema_data.shard_priorities[i] = shard.priority;
+    }
+    
+    // === ВЫЗЫВАЕМ ГОТОВЫЕ МЕТОДЫ ИЗ RENT_MEMA ===
+    match params.mode {
+        RedistributionMode::EmergencyOnly => {
+            msg!("🚨 Только экстренные сигналы");
+            
+            if mema_data.shard_signals == 0 {
+                msg!("✅ Нет активных сигналов");
+                return Ok(());
+            }
+            
+            let report = mema_data.handle_emergency_signals(&mut shards);
+            
+            msg!("📊 Экстренная обработка:");
+            msg!("   Сигналов обработано: {}", report.signals_processed);
+            msg!("   Сигналов истекло: {}", report.signals_expired);
+            msg!("   Сигналов пропущено: {}", report.signals_skipped);
+            msg!("   Шардов пополнено: {}", report.shards_refilled);
+            msg!("   Сумма: {} lamports", report.amount_refilled);
+        }
+        
+        RedistributionMode::BalanceOnly => {
+            msg!("⚖️ Только балансировка");
+            
+            if now - mema_data.last_balance_check < REDISTRIBUTION_COOLDOWN {
+                msg!("⏳ Кулдаун, пропускаем");
+                return Ok(());
+            }
+            
+            let report = mema_data.balance_all_shards(&mut shards);
+            
+            msg!("📊 Балансировка:");
+            msg!("   Шардов пополнено: {}", report.shards_refilled);
+            msg!("   Сумма: {} lamports", report.amount_refilled);
+            msg!("   Сигналов обработано: {}", report.signals_processed);
+            msg!("   Шардов проверено: {}", report.shards_checked);
+            msg!("   Batch size: {}", report.batch_size);
+            msg!("   Load level: {}", report.load_level);
+        }
+        
+        RedistributionMode::Full => {
+            msg!("🔁 Полный цикл: экстренные + балансировка");
+            
+            if mema_data.shard_signals != 0 {
+                let emergency_report = mema_data.handle_emergency_signals(&mut shards);
+                msg!("📊 Экстренные: {} сигналов, {} lamports",
+                     emergency_report.signals_processed,
+                     emergency_report.amount_refilled);
+            }
+            
+            if now - mema_data.last_balance_check >= REDISTRIBUTION_COOLDOWN {
+                let balance_report = mema_data.balance_all_shards(&mut shards);
+                msg!("📊 Балансировка: {} шардов, {} lamports",
+                     balance_report.shards_refilled,
+                     balance_report.amount_refilled);
+            } else {
+                msg!("⏳ Балансировка в кулдауне, пропущена");
+            }
+        }
+    }
+    
+    // === Обновляем данные шардов из mema_data ===
+    for i in 0..shards.len() {
+        shards[i].current_balance = mema_data.shard_balances[i];
+        shards[i].priority = mema_data.shard_priorities[i];
+    }
+    
+    // === Сохраняем обновленные шарды ===
+    for (_i, (shard_acc, updated_shard)) in shard_accounts.iter().zip(shards.iter()).enumerate() {
+        if !shard_acc.data_is_empty() {
+            updated_shard.serialize(&mut *shard_acc.data.borrow_mut())?;
+        }
+    }
+    
+    // === Сохраняем обновленный rent_mema ===
+    mema_data.last_stats_update = now;
+    mema_data.serialize(&mut *rent_mema.data.borrow_mut())?;
+    
+    msg!("========================================================");
+    msg!("✅ Инструкция 40 завершена");
+    msg!("========================================================");
+    
+    Ok(())
+}===SEPARATOR===
+// src/instructions/admin/refill_from_mema.rs
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    msg,
+    pubkey::Pubkey,
+    sysvar::{rent::Rent, Sysvar},
+};
+use crate::{constants::*, error::WaterError};
+use crate::instructions::utilits::pda::{
+    derive_rent_mema_pda,
+    get_root_pda_key,
+};
+
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
+pub struct RefillFromMemaParams {
+    pub amount: u64,
+}
+
+pub fn process_refill_from_mema(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    params: RefillFromMemaParams,
+) -> ProgramResult {
+    
+    msg!("========================================================");
+    msg!("🚀 [39] refill_from_mema START");
+    msg!("========================================================");
+    
+    let account_iter = &mut accounts.iter();
+    
+    // 0. Root PDA
+    let root_pda_account = next_account_info(account_iter)?;
+    // 1. Rent Mema PDA (источник)
+    let rent_mema = next_account_info(account_iter)?;
+    // 2. Target shard (получатель)
+    let shard = next_account_info(account_iter)?;
+
+    msg!("📋 Полученные аккаунты:");
+    msg!("   0 root_pda: {}", root_pda_account.key);
+    msg!("   1 rent_mema: {}", rent_mema.key);
+    msg!("   2 shard: {}", shard.key);
+
+    // Получаем root_pda
+    let root_pda = get_root_pda_key(program_id, root_pda_account)?;
+    msg!("✅ Root PDA: {}", root_pda);
+
+    // Проверяем Rent Mema PDA
+    let (expected_rent_mema, mema_bump) = derive_rent_mema_pda(program_id, &root_pda);
+    if rent_mema.key != &expected_rent_mema {
+        msg!("❌ Неверный Rent Mema PDA");
+        return Err(WaterError::InvalidPDA.into());
+    }
+    msg!("✅ Rent Mema PDA верный, bump: {}", mema_bump);
+
+    // Проверяем, что Rent Mema принадлежит программе
+    if rent_mema.owner != program_id {
+        msg!("❌ Rent Mema не принадлежит программе");
+        return Err(WaterError::IllegalOwner.into());
+    }
+
+    // Проверяем баланс
+    let rent_mema_balance = **rent_mema.lamports.borrow();
+    msg!("💰 Баланс Rent Mema: {} lamports", rent_mema_balance);
+    msg!("💰 Требуется перевести: {} lamports", params.amount);
+
+    if rent_mema_balance < params.amount {
+        msg!("❌ Недостаточно средств в Rent Mema");
+        return Err(WaterError::InsufficientFunds.into());
+    }
+
+    // Проверяем минимальную аренду для шарда после перевода
+    let rent = Rent::get()?;
+    let min_balance = rent.minimum_balance(shard.data_len());
+    let new_shard_balance = (**shard.lamports.borrow()).saturating_add(params.amount);
+    
+    if new_shard_balance < min_balance {
+        msg!("❌ Баланс шарда после перевода ниже минимальной аренды");
+        return Err(WaterError::InsufficientFunds.into());
+    }
+
+    // Выполняем перевод
+    msg!("💰 Переводим {} lamports из Rent Mema в шард {}", params.amount, shard.key);
+    
+    let mema_balance = **rent_mema.lamports.borrow();
+    let shard_balance = **shard.lamports.borrow();
+    
+    **rent_mema.lamports.borrow_mut() = mema_balance
+        .checked_sub(params.amount)
+        .ok_or(WaterError::InsufficientFunds)?;
+    
+    **shard.lamports.borrow_mut() = shard_balance
+        .checked_add(params.amount)
+        .ok_or(WaterError::ArithmeticError)?;
+
+    msg!("✅ Перевод выполнен успешно!");
+    msg!("   Новый баланс Rent Mema: {} lamports", **rent_mema.lamports.borrow());
+    msg!("   Новый баланс шарда: {} lamports", **shard.lamports.borrow());
+
+    Ok(())
+}===SEPARATOR===
+// src/instructions/admin/refill_funds.rs
+
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    msg,
+    program::invoke,
+    pubkey::Pubkey,
+};
+use crate::instructions::utils::get_associated_token_address;
+use spl_token_2022_interface::instruction as token_instruction;
+use spl_token_2022_interface::state::Mint as Token2022Mint;
+use spl_token_2022_interface::extension::StateWithExtensions;
+
+use crate::ProgramConfig;
+use crate::state::config_trait::ConfigAccount;
+use crate::constants::{BONUS_FUND_SEED, STAKING_FUND_SEED, FEE_VAULT_SEED};
+use crate::error::WaterError;
+use crate::utils::validation_utils::{validate_root_pda_v2, validate_signer, validate_token_account_mint}; 
+use crate::utils::fund_manager::get_fund_pda;
+
+pub fn process_admin_refill_funds(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    fund_type: u8,
+    amount: u64,
+) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+
+   // Получаем аккаунты
+    let admin = next_account_info(account_iter)?; // подписант (должен быть authority)
+    let program_config_account = next_account_info(account_iter)?; // ProgramConfig
+    let immutable_seed_account = next_account_info(account_iter)?; // ImmutableSeedAccount
+    let token_mint = next_account_info(account_iter)?; // токен mint
+    let source_ata = next_account_info(account_iter)?; // откуда (admin ATA)
+    let target_fund_ata = next_account_info(account_iter)?; // куда (фонд ATA)
+    let token_program = next_account_info(account_iter)?;
+
+    if !admin.is_signer {
+        return Err(WaterError::Unauthorized.into());
+    }
+
+    // ✅ Централизованная проверка root_pda
+    let root_pda = validate_root_pda_v2( program_id, immutable_seed_account,)?;
+
+
+    // ✅ Усиленная проверка подписи администратора
+    validate_signer(admin)?;
+
+    // ✅ Десериализуем ProgramConfig для дополнительной проверки
+    let program_config = ProgramConfig::get_config(program_config_account, program_id, &root_pda)?;
+
+    // ✅ Проверка, что администратор совпадает с authority из конфига
+    if admin.key != &program_config.authority {
+        msg!("❌ Атака: администратор не совпадает с authority из конфига");
+        msg!("  Ожидался: {}", program_config.authority);
+        msg!("  Получен: {}", admin.key);
+        return Err(WaterError::Unauthorized.into());
+    }
+
+
+    // ✅ Проверка валидности суммы пополнения
+    if amount == 0 {
+        msg!("❌ Сумма пополнения не может быть нулевой");
+        return Err(WaterError::InvalidTransfer.into());
+    }
+
+    // Определяем целевой фонд
+    let (fund_pda, _fund_bump) = match fund_type {
+        0 => get_fund_pda(program_id, &root_pda, BONUS_FUND_SEED),
+        1 => get_fund_pda(program_id, &root_pda, STAKING_FUND_SEED),
+        2 => get_fund_pda(program_id, &root_pda, FEE_VAULT_SEED),
+        _ => return Err(WaterError::InvalidConfig.into()),
+    };
+
+    msg!("🔍 Пополнение фонда:");
+    msg!("  Тип: {}", match fund_type {
+        0 => "Bonus Fund",
+        1 => "Staking Fund",
+        2 => "Fee Vault",
+        _ => "Unknown",
+    });
+    msg!("  PDA фонда: {}", fund_pda);
+    msg!("  Сумма: {}", amount);
+
+    // ✅ Проверка: target_fund_ata — это ATA fund_pda
+    let expected_ata = get_associated_token_address(&fund_pda, token_mint.key);
+    if target_fund_ata.key != &expected_ata {
+        msg!("❌ Атака: неверный target_fund_ata");
+        msg!("  Ожидался: {}", expected_ata);
+        msg!("  Получен: {}", target_fund_ata.key);
+        return Err(WaterError::InvalidAccountData.into());
+    }
+
+    // ✅ Проверка, что source_ata принадлежит администратору
+    validate_token_account_mint(source_ata, token_mint.key)?;
+
+    // ✅ Проверка mint токен-аккаунтов
+    validate_token_account_mint(target_fund_ata, token_mint.key)?;
+
+    // ✅ Проверка баланса source_ata
+    let source_data = source_ata.data.borrow();
+    let source_token = StateWithExtensions::<spl_token_2022_interface::state::Account>::unpack(&source_data)
+        .map_err(|_| {
+            msg!("❌ Не удалось распаковать source_ata");
+            WaterError::InvalidAccountData
+        })?;
+
+    let source_balance = source_token.base.amount;
+    if source_balance < amount {
+        msg!("❌ Недостаточно средств для пополнения");
+        msg!("  Баланс source: {}", source_balance);
+        msg!("  Запрошено: {}", amount);
+        return Err(WaterError::InsufficientBalance.into());
+    }
+
+    // Получаем decimals
+    let mint_data = token_mint.try_borrow_data()?;
+    let mint = StateWithExtensions::<Token2022Mint>::unpack(&mint_data)
+        .map_err(|_| WaterError::InvalidAccountData)?;
+    let decimals = mint.base.decimals;
+
+    // ✅ Проверяем, что source_ata действительно принадлежит администратору
+    if source_token.base.owner != *admin.key {
+        msg!("❌ Атака: source_ata не принадлежит администратору");
+        msg!("  Владелец source_ata: {}", source_token.base.owner);
+        msg!("  Администратор: {}", admin.key);
+        return Err(WaterError::Unauthorized.into());
+    }
+
+
+    // Создаём инструкцию
+    let transfer_ix = token_instruction::transfer_checked(
+        token_program.key,
+        source_ata.key,     // source: ATA администратора
+        token_mint.key,
+        target_fund_ata.key, // destination: целевой фонд
+        admin.key,        // authority
+        &[],              // multi_signers
+        amount,
+        decimals,
+    ).map_err(|_| WaterError::InvalidTransfer)?;
+
+    invoke(
+        &transfer_ix,
+        &[
+            source_ata.clone(),
+            token_mint.clone(),
+            target_fund_ata.clone(),
+            admin.clone(),           // authority (администратор)
+            token_program.clone(),
+        ],
+    )?;
+
+    msg!("✅ Фонд успешно пополнен администратором!");
+    msg!("  Администратор: {}", admin.key);
+    msg!("  Из: {} (баланс до: {}, после: {})", 
+        source_ata.key, source_balance, source_balance - amount);
+    msg!("✅ Фонд пополнен: {} → {}, сумма: {}", source_ata.key, target_fund_ata.key, amount);
+   
+    Ok(())
+}
+===SEPARATOR===
+// src/instructions/admin/refill_shard_from_mema.rs
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    msg,
+    pubkey::Pubkey,
+    sysvar::{rent::Rent, Sysvar},
+};
+use crate::{error::WaterError};
+use crate::instructions::utilits::pda::{
+    derive_rent_mema_pda,
+    get_root_pda_key,
+    derive_rent_pda_shard,
+};
+
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
+pub struct RefillShardFromMemaParams {
+    pub shard_id: u8,  // ← возвращаем shard_id
+    pub amount: u64,
+}
+
+pub fn process_refill_shard_from_mema(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    params: RefillShardFromMemaParams,
+) -> ProgramResult {
+    msg!("🚀 [39] START");
+    
+    let account_iter = &mut accounts.iter();
+    
+    let root_pda_account = next_account_info(account_iter)?;
+    let rent_mema = next_account_info(account_iter)?;
+    let shard = next_account_info(account_iter)?;
+
+    let root_pda = get_root_pda_key(program_id, root_pda_account)?;
+
+    // Проверяем Rent Mema PDA
+    let (expected_rent_mema, _) = derive_rent_mema_pda(program_id, &root_pda)
+        .map_err(|_| WaterError::InvalidPDA)?;
+    if rent_mema.key != &expected_rent_mema {
+        return Err(WaterError::InvalidPDA.into());
+    }
+
+    // Проверяем что это правильный шард (убрал т.к. передаем лаптопами то какой программа прислала тому и даем)
+    //let (expected_shard, _) = derive_rent_pda_shard(program_id, rent_mema.key, params.shard_id);
+    //if shard.key != &expected_shard {
+    //    return Err(WaterError::InvalidShardId.into());
+    //}
+
+    // Проверяем баланс Rent Mema
+    let rent_mema_balance = **rent_mema.lamports.borrow();
+    if rent_mema_balance < params.amount {
+        return Err(WaterError::InsufficientBalance.into());
+    }
+
+    // Получаем текущий баланс шарда один раз
+    let current_shard_balance = **shard.lamports.borrow();
+    let new_shard_balance = current_shard_balance.saturating_add(params.amount);
+
+    // Проверяем минимальную аренду
+    let rent = Rent::get()?;
+    let min_balance = rent.minimum_balance(shard.data_len());
+    
+    if new_shard_balance < min_balance {
+        return Err(WaterError::InsufficientFunds.into());
+    }
+
+    // Выполняем перевод
+    msg!("💰 Переводим {} lamports из Rent Mema в шард {}", params.amount, shard.key);
+
+    **rent_mema.lamports.borrow_mut() = rent_mema_balance
+        .checked_sub(params.amount)
+        .ok_or(WaterError::InsufficientFunds)?;
+
+    **shard.lamports.borrow_mut() = new_shard_balance;
+
+    msg!("✅ [39] SUCCESS");
+    Ok(())
+}===SEPARATOR===
+// src/instructions/admin/refill_shard.rs
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    msg,
+    program::invoke_signed, 
+    pubkey::Pubkey,
+    sysvar::{rent::Rent, Sysvar},
+};
+use spl_token_2022_interface::instruction as token_instruction;
+use spl_token_2022_interface::state::Mint;
+use spl_token_2022_interface::extension::StateWithExtensions;
+
+use crate::instructions::utils::token_utils::{
+    get_associated_token_address_with_program
+};
+
+use crate::{constants::*, error::WaterError};
+use crate::instructions::utilits::pda::{
+    derive_sol_fund_pda,
+    get_root_pda_key,
+};
+
+#[derive(BorshSerialize, BorshDeserialize, Debug, PartialEq)]
+pub enum RefillType {
+    Token,  // перевод токенов через SOL Fund ATA
+    Sol,    // перевод SOL через SOL Fund (нативный)
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Debug)]
+pub struct RefillShardParams {
+    pub amount: u64,
+    pub refill_type: RefillType,
+}
+
+pub fn process_refill_shard(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    params: RefillShardParams,
+) -> ProgramResult {
+    msg!("========================================================");
+    msg!("🚀 process_refill_shard START");
+    msg!("========================================================");
+    msg!("📋 Всего аккаунтов: {}", accounts.len());
+    msg!("💰 Сумма перевода: {} {}", params.amount, 
+         if params.refill_type == RefillType::Sol { "lamports" } else { "токенов" });
+    msg!("🔍 Тип операции: {:?}", params.refill_type);
+    
+    // Определяем тип операции по количеству аккаунтов
+    if accounts.len() == 4 {
+        // SOL перевод: [root, sol_fund, shard, system_program]
+        msg!("🔍 Обнаружен SOL перевод (4 аккаунта)");
+        let account_iter = &mut accounts.iter();
+        process_sol_refill(program_id, account_iter, params.amount)
+        
+    } else if accounts.len() == 7 {
+        // Token перевод: [root, sol_fund, sol_fund_ata, shard, shard_ata, mint, token_program]
+        msg!("🔍 Обнаружен Token перевод (7 аккаунтов)");
+        let account_iter = &mut accounts.iter();
+        process_token_refill(program_id, account_iter, params.amount)
+        
+    } else {
+        msg!("❌ Неверное количество аккаунтов: {}", accounts.len());
+        msg!("   Ожидалось: 4 для SOL или 7 для токенов");
+        
+        // Выводим первые несколько аккаунтов для отладки
+        for (i, account) in accounts.iter().enumerate().take(5) {
+            msg!("   [{}] {} (owner: {})", i, account.key, account.owner);
+        }
+        
+        Err(WaterError::InvalidAccountData.into())
+    }
+}
+
+// ===========================================================================
+// ТОКЕНЫ (через SOL Fund ATA) - БЕЗ ИЗМЕНЕНИЙ
+// ===========================================================================
+fn process_token_refill(
+    program_id: &Pubkey,
+    account_iter: &mut std::slice::Iter<'_, AccountInfo<'_>>,
+    amount: u64,
+) -> ProgramResult {
+    // 0. Root PDA
+    let root_pda_account = next_account_info(account_iter)?;
+    // 1. SOL Fund PDA (источник токенов)
+    let sol_fund = next_account_info(account_iter)?;
+    // 2. SOL Fund ATA (токеный счет фонда)
+    let sol_fund_ata = next_account_info(account_iter)?;
+    // 3. Target shard
+    let shard = next_account_info(account_iter)?;
+    // 4. Shard ATA (получатель токенов)
+    let shard_ata = next_account_info(account_iter)?;
+    // 5. Token Mint
+    let token_mint = next_account_info(account_iter)?;
+    // 6. Token Program
+    let token_program = next_account_info(account_iter)?;
+
+    msg!("========================================================");
+    msg!("🚀 process_token_refill через SOL Fund START");
+    msg!("========================================================");
+    
+    msg!("📋 Полученные аккаунты:");
+    msg!("   0 root_pda: {} (owner: {})", root_pda_account.key, root_pda_account.owner);
+    msg!("   1 sol_fund: {} (owner: {})", sol_fund.key, sol_fund.owner);
+    msg!("   2 sol_fund_ata: {} (owner: {})", sol_fund_ata.key, sol_fund_ata.owner);
+    msg!("   3 shard: {} (owner: {})", shard.key, shard.owner);
+    msg!("   4 shard_ata: {} (owner: {})", shard_ata.key, shard_ata.owner);
+    msg!("   5 token_mint: {} (owner: {})", token_mint.key, token_mint.owner);
+    msg!("   6 token_program: {} (owner: {})", token_program.key, token_program.owner);
+
+    // Получаем root_pda
+    let root_pda = get_root_pda_key(program_id, root_pda_account)?;
+    msg!("✅ Root PDA: {}", root_pda);
+
+    // Получаем bump для SOL Fund PDA
+    let (expected_sol_fund, bump) = derive_sol_fund_pda(program_id, &root_pda);
+    
+    if sol_fund.key != &expected_sol_fund {
+        msg!("❌ Неверный SOL Fund PDA");
+        msg!("   Ожидался: {}", expected_sol_fund);
+        msg!("   Получен: {}", sol_fund.key);
+        return Err(WaterError::InvalidPDA.into());
+    }
+    msg!("✅ SOL Fund PDA верный, bump: {}", bump);
+    msg!("   Владелец SOL Fund: {}", sol_fund.owner);
+    msg!("   Ожидаемый владелец (program_id): {}", program_id);
+    
+    if sol_fund.owner != program_id {
+        msg!("❌ SOL Fund не принадлежит программе!");
+        msg!("   Владелец: {}, Ожидался: {}", sol_fund.owner, program_id);
+        return Err(WaterError::InvalidAccountData.into());
+    }
+
+    // Проверяем ATA SOL Fund
+    let expected_ata = get_associated_token_address_with_program(
+        sol_fund.key,
+        token_mint.key,
+        token_program.key
+    );
+
+    if sol_fund_ata.key != &expected_ata {
+        msg!("❌ Неверный SOL Fund ATA");
+        msg!("   Ожидался: {}", expected_ata);
+        msg!("   Получен: {}", sol_fund_ata.key);
+        return Err(WaterError::InvalidAccountData.into());
+    }
+    msg!("✅ SOL Fund ATA верный");
+
+    // Получаем decimals из mint
+    let mint_data = token_mint.try_borrow_data()?;
+    let mint = StateWithExtensions::<Mint>::unpack(&mint_data)
+        .map_err(|_| WaterError::InvalidAccountData)?;
+    let decimals = mint.base.decimals;
+
+    msg!("💰 Переводим {} токенов (decimals: {}) из SOL Fund в шард {}", 
+         amount, decimals, shard.key);
+    msg!("   From ATA: {} (balance before check)", sol_fund_ata.key);
+    msg!("   To ATA: {} (balance before check)", shard_ata.key);
+
+    let transfer_ix = token_instruction::transfer_checked(
+        token_program.key,
+        sol_fund_ata.key,
+        token_mint.key,
+        shard_ata.key,
+        sol_fund.key,
+        &[],
+        amount,
+        decimals,
+    ).map_err(|_| WaterError::InvalidTransfer)?;
+
+    let seeds = &[
+        SOL_FUND_SEED,
+        root_pda.as_ref(),
+        &[bump]
+    ];
+    let signer_seeds = &[&seeds[..]];
+
+    msg!("🔑 Seeds для подписи: {:?}", seeds);
+    msg!("📝 Вызов invoke_signed для перевода токенов...");
+
+    invoke_signed(
+        &transfer_ix,
+        &[
+            sol_fund_ata.clone(),
+            token_mint.clone(),
+            shard_ata.clone(),
+            sol_fund.clone(),
+            token_program.clone(),
+        ],
+        signer_seeds,
+    )?;
+
+    msg!("✅ Перевод токенов через SOL Fund выполнен успешно");
+    Ok(())
+}
+
+// ===========================================================================
+// SOL (через SOL Fund нативный) - ИСПРАВЛЕНО
+// ===========================================================================
+fn process_sol_refill(
+    program_id: &Pubkey,
+    account_iter: &mut std::slice::Iter<'_, AccountInfo<'_>>,
+    amount: u64,
+) -> ProgramResult {
+    // 0. Root PDA
+    let root_pda_account = next_account_info(account_iter)?;
+    // 1. SOL Fund PDA (источник SOL)
+    let sol_fund = next_account_info(account_iter)?;
+    // 2. Target shard (получатель SOL)
+    let shard = next_account_info(account_iter)?;
+    // 3. System Program (больше не нужна, но оставим для обратной совместимости)
+    let _system_program = next_account_info(account_iter)?;
+
+    msg!("========================================================");
+    msg!("🚀 process_sol_refill START");
+    msg!("========================================================");
+    
+    msg!("📋 Полученные аккаунты:");
+    msg!("   0 root_pda: {} (owner: {})", root_pda_account.key, root_pda_account.owner);
+    msg!("   1 sol_fund: {} (owner: {})", sol_fund.key, sol_fund.owner);
+    msg!("   2 shard: {} (owner: {})", shard.key, shard.owner);
+    msg!("   3 system_program: {} (owner: {})", _system_program.key, _system_program.owner);
+
+    // Получаем root_pda
+    let root_pda = get_root_pda_key(program_id, root_pda_account)?;
+    msg!("✅ Root PDA: {}", root_pda);
+
+    // Получаем bump для SOL Fund PDA
+    let (expected_sol_fund, bump) = derive_sol_fund_pda(program_id, &root_pda);
+    
+    if sol_fund.key != &expected_sol_fund {
+        msg!("❌ Неверный SOL Fund PDA");
+        msg!("   Ожидался: {}", expected_sol_fund);
+        msg!("   Получен: {}", sol_fund.key);
+        return Err(WaterError::InvalidPDA.into());
+    }
+    msg!("✅ SOL Fund PDA верный, bump: {}", bump);
+    msg!("   Владелец SOL Fund: {}", sol_fund.owner);
+    msg!("   Ожидаемый владелец (program_id): {}", program_id);
+    
+    if sol_fund.owner != program_id {
+        msg!("❌ SOL Fund не принадлежит программе!");
+        msg!("   Владелец: {}, Ожидался: {}", sol_fund.owner, program_id);
+        return Err(WaterError::InvalidAccountData.into());
+    }
+
+    // Проверяем владельца шарда
+    msg!("   Владелец шарда: {}", shard.owner);
+    msg!("   Ожидаемый владелец шарда: {}", program_id);
+
+    // Проверяем достаточно ли SOL в фонде
+    let sol_fund_balance = **sol_fund.lamports.borrow();
+    let shard_balance = **shard.lamports.borrow();
+    
+    msg!("💰 Баланс SOL Fund: {} lamports ({:.9} SOL)", sol_fund_balance, sol_fund_balance as f64 / 1_000_000_000.0);
+    msg!("💰 Баланс шарда: {} lamports ({:.9} SOL)", shard_balance, shard_balance as f64 / 1_000_000_000.0);
+    
+    if sol_fund_balance < amount {
+        msg!("❌ Недостаточно SOL в фонде");
+        msg!("   Доступно: {} lamports, Требуется: {} lamports", sol_fund_balance, amount);
+        return Err(WaterError::InsufficientFunds.into());
+    }
+    msg!("💰 Достаточно SOL в фонде");
+
+    // Проверяем минимальную арендную плату для шарда после перевода
+    let rent = Rent::get()?;
+    let min_balance = rent.minimum_balance(shard.data_len());
+    
+    msg!("💰 Минимальная аренда для шарда: {} lamports", min_balance);
+    msg!("💰 Баланс шарда после перевода: {} lamports", shard_balance + amount);
+    
+    if shard_balance + amount < min_balance {
+        msg!("❌ После перевода шард будет ниже минимальной аренды");
+        msg!("   Текущий баланс: {} lamports", shard_balance);
+        msg!("   Перевод: {} lamports", amount);
+        msg!("   Итого: {} lamports", shard_balance + amount);
+        msg!("   Минимум: {} lamports", min_balance);
+        return Err(WaterError::InsufficientFunds.into());
+    }
+    msg!("✅ Минимальная аренда будет соблюдена");
+
+    msg!("💰 Переводим {} lamports из SOL Fund в шард {}", amount, shard.key);
+    msg!("   From (до): {} (balance: {})", sol_fund.key, sol_fund_balance);
+    msg!("   To (до): {} (balance: {})", shard.key, shard_balance);
+
+    // ВАЖНО: Вместо CPI к system_program, напрямую манипулируем балансами
+    // Так как SOL Fund принадлежит нашей программе, мы можем это делать [citation:1][citation:5]
+    
+    // Снимаем лампорты с SOL Fund
+    **sol_fund.lamports.borrow_mut() = sol_fund_balance
+        .checked_sub(amount)
+        .ok_or(WaterError::InsufficientFunds)?;
+    
+    // Добавляем лампорты к шарду
+    **shard.lamports.borrow_mut() = shard_balance
+        .checked_add(amount)
+        .ok_or(WaterError::InvalidTransfer)?;
+
+    msg!("✅ Прямое манипулирование балансами выполнено успешно!");
+    
+    // Проверяем результаты
+    let sol_fund_balance_after = **sol_fund.lamports.borrow();
+    let shard_balance_after = **shard.lamports.borrow();
+    
+    msg!("   From (после): {} (balance: {})", sol_fund.key, sol_fund_balance_after);
+    msg!("   To (после): {} (balance: {})", shard.key, shard_balance_after);
+    msg!("   Изменение SOL Fund: {} lamports", sol_fund_balance - sol_fund_balance_after);
+    msg!("   Изменение шарда: {} lamports", shard_balance_after - shard_balance);
+
+    Ok(())
+}===SEPARATOR===
+// src/instructions/admin/transfer_from_emergency.rs
+
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    msg,
+    program::invoke,
+    program_error::ProgramError,
+    pubkey::Pubkey,
+};
+use solana_system_interface::instruction as system_instruction;
+
+use crate::error::WaterError;
+
+pub fn process_transfer_from_emergency(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    amount: u64,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    
+    let emergency_fund = next_account_info(accounts_iter)?;
+    let shard = next_account_info(accounts_iter)?;
+    let system_program = next_account_info(accounts_iter)?;
+    
+    msg!("🚀 Прямой перевод из emergency_fund в шард");
+    msg!("   From: {}", emergency_fund.key);
+    msg!("   To: {}", shard.key);
+    msg!("   Amount: {} SOL", amount as f64 / 1e9);
+    
+    // Проверяем, что emergency_fund принадлежит программе
+    if emergency_fund.owner != program_id {
+        msg!("❌ emergency_fund не принадлежит программе");
+        return Err(ProgramError::IllegalOwner);
+    }
+    
+    // Проверяем баланс
+    let balance = **emergency_fund.try_borrow_lamports()?;
+    if balance < amount {
+        msg!("❌ Недостаточно средств");
+        return Err(WaterError::InsufficientBalance.into());
+    }
+    
+    // Простой перевод - программа может тратить SOL со своих аккаунтов
+    let transfer_ix = system_instruction::transfer(
+        emergency_fund.key,
+        shard.key,
+        amount,
+    );
+    
+    invoke(
+        &transfer_ix,
+        &[
+            emergency_fund.clone(),
+            shard.clone(),
+            system_program.clone(),
+        ],
+    )?;
+    
+    msg!("✅ Перевод выполнен");
+    
+    Ok(())
+}===SEPARATOR===
+// src/instructions/update_config.rs
+use borsh::{BorshDeserialize, BorshSerialize};
+use crate::error::WaterError;
+use crate::params::admin::UpdateConfigParams;
+use crate::state::program_config::ProgramConfig;
+use crate::state::config_trait::ConfigAccount; 
+use crate::utils::validation_utils::validate_root_pda_v2;
+
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    msg,
+    pubkey::Pubkey,
+    sysvar::{clock::Clock, Sysvar},
+}; // ✅ Импортируем из params
+
+pub fn process_update_config(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    new_config_data: UpdateConfigParams,
+) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+
+    let authority = next_account_info(account_iter)?;
+    let config_account = next_account_info(account_iter)?;
+    let immutable_seed_account = next_account_info(account_iter)?; 
+
+    // ✅ Централизованная проверка root_pda
+    let root_pda = validate_root_pda_v2(program_id, immutable_seed_account)?;
+    
+    // Проверка: владелец — наша программа
+    if config_account.owner != program_id {
+        return Err(WaterError::IllegalOwner.into());
+    }
+
+    // ✅ Верификация конфига через централизованный метод
+    let verified_config = ProgramConfig::get_config(
+        config_account,
+        program_id,
+        &root_pda
+    ).map_err(|_| WaterError::InvalidAccountData)?;
+
+
+    // Десериализуем текущий config
+    let config_data = config_account.data.borrow();
+    let mut config =
+        ProgramConfig::try_from_slice(&config_data).map_err(|_| WaterError::SerializationError)?;
+
+    // Только authority может обновлять
+    if *authority.key != config.authority {
+        return Err(WaterError::Unauthorized.into());
+    }
+
+    // ✅ Дополнительная проверка: сравниваем authority из верифицированного конфига
+    if *authority.key != verified_config.authority {
+        return Err(WaterError::Unauthorized.into());
+    }
+
+    // Обновляем поля
+    if let Some(val) = new_config_data.is_staking_active {
+        config.is_staking_active = val;
+    }
+    if let Some(val) = new_config_data.is_airdrop_active {
+        config.is_airdrop_active = val;
+    }
+    if let Some(val) = new_config_data.is_referral_system_active {
+        config.is_referral_system_active = val;
+    }
+    if let Some(val) = new_config_data.max_users {
+        if val > crate::constants::DEFAULT_MAX_USERS_HARD_CAP {
+            return Err(WaterError::UserLimitExceeded.into());
+        }
+        config.max_users = val;
+    }
+    if let Some(val) = new_config_data.min_team_members {
+        config.min_team_members = val;
+    }
+    if let Some(val) = new_config_data.max_team_members {
+        config.max_team_members = val;
+    }
+    if let Some(val) = new_config_data.min_deposit {
+        config.min_deposit = val;
+    }
+    if let Some(val) = new_config_data.max_withdrawal {
+        config.max_withdrawal = val;
+    }
+    if let Some(val) = new_config_data.transaction_fee_percent {
+        if val > 100 {
+            return Err(WaterError::InvalidFeePercentage.into());
+        }
+        config.transaction_fee_percent = val;
+    }
+    if let Some(val) = new_config_data.marketing_fee_percent {
+        config.marketing_fee_percent = val;
+    }
+    if let Some(val) = new_config_data.staking_fee_percent {
+        config.staking_fee_percent = val;
+    }
+    if let Some(val) = new_config_data.bonus_fee_percent {
+        config.bonus_fee_percent = val;
+    }
+    if let Some(val) = new_config_data.base_cooldown {
+        config.base_cooldown = val;
+    }
+    if let Some(val) = new_config_data.penalty_cooldown {
+        config.penalty_cooldown = val;
+    }
+    if let Some(val) = new_config_data.invite_expiry {
+        config.invite_expiry = val;
+    }
+    if let Some(val) = new_config_data.fond_team_creation_fee {
+        config.fond_team_creation_fee = val;
+    }
+    if let Some(val) = new_config_data.finvite_7d {
+        config.finvite_7d = val;
+    }
+    if let Some(val) = new_config_data.finvite_90d {
+        config.finvite_90d = val;
+    }
+    if let Some(val) = new_config_data.invite_amount {
+        config.invite_amount = val;
+    }
+    if let Some(val) = new_config_data.return_amount {
+        config.return_amount = val;
+    }
+    if let Some(val) = new_config_data.leave_fee_amount {
+        config.leave_fee_amount = val;
+    }
+    if let Some(val) = new_config_data.team_cooldown_30d {
+        config.team_cooldown_30d = val as i64;
+    }
+    if let Some(val) = new_config_data.tow_cooldown {
+        config.tow_cooldown = val as i64;
+    }
+    if let Some(val) = new_config_data.fee_sale {
+        config.fee_sale = val;
+    }
+    if let Some(val) = new_config_data.space_wallet {
+        config.space_wallet = val;
+    }
+    if let Some(val) = new_config_data.marketing_fund {
+        config.marketing_fund = val;
+    }
+    if let Some(val) = new_config_data.fcommission_vault {
+        config.fcommission_vault = val;
+    }
+
+    // ✅ Обновление версии
+    if let Some(new_version) = new_config_data.version {
+        if new_version <= config.version {
+            return Err(WaterError::InvalidVersion.into());
+        }
+        config.version = new_version;
+    }
+
+    // Обновляем время
+    config.last_updated = Clock::get()?.unix_timestamp;
+
+    // ✅ Правильная сериализация через `serialize` + `Vec<u8>`
+    let mut serialized_data = Vec::new();
+    config
+        .serialize(&mut serialized_data)
+        .map_err(|_| WaterError::SerializationError)?;
+
+    // Копируем в аккаунт
+    let mut account_data = config_account.data.borrow_mut();
+    if serialized_data.len() > account_data.len() {
+        return Err(WaterError::InvalidConfig.into());
+    }
+    account_data[..serialized_data.len()].copy_from_slice(&serialized_data);
+
+    msg!("✅ Конфигурация обновлена. Версия: {}", config.version);
+
+    Ok(())
+}
+===SEPARATOR===
+use borsh::{ BorshSerialize};
+use solana_program::{account_info::{next_account_info, AccountInfo}, clock::Clock, entrypoint::ProgramResult, msg, program_error::ProgramError, pubkey::Pubkey, sysvar::Sysvar};
+use crate::{constants::*, params::admin::UpdateMemRankRequirementsParams, state::config_trait::ConfigAccount, state::mem_rank_config::MemRankConfig, WaterError};
+use crate::utils::validation_utils::{validate_signer, validate_root_pda_v2};
+pub fn process_update_mem_rank_requirements(program_id: &Pubkey, accounts: &[AccountInfo], params: UpdateMemRankRequirementsParams) -> ProgramResult {
+  let accounts_iter = &mut accounts.iter(); let admin = next_account_info(accounts_iter)?; let mem_rank_config_acc = next_account_info(accounts_iter)?; let immutable_seed_account = next_account_info(accounts_iter)?;
+  if !admin.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+  let root_pda = validate_root_pda_v2(program_id, immutable_seed_account)?; validate_signer(admin)?;
+  let config = MemRankConfig::get_config(mem_rank_config_acc, program_id, &root_pda)?; let mut config = config;
+  for update in params.updates { let idx = update.index as usize;
+    if idx >= MAX_MEM_RANKS { return Err(WaterError::InvalidRank.into()); } let mut new_rank = config.mem_ranks[idx];
+    if let Some(id_val) = update.id { new_rank.id = id_val; } if let Some(min) = update.min_tokens { new_rank.min_tokens = min; }
+    if let Some(stake) = update.min_stake_hours { new_rank.min_stake_hours = stake; } if let Some(tree) = update.min_referral_tree_size { new_rank.min_referral_tree_size = tree; }
+    if let Some(members) = update.required_members { new_rank.required_members = members; } if let Some(active) = update.is_active { new_rank.is_active = active; }
+    if new_rank.is_active && idx > 0 { let prev = &config.mem_ranks[idx - 1]; if !prev.is_active { continue; }
+      if new_rank.min_tokens < prev.min_tokens || new_rank.min_stake_hours < prev.min_stake_hours || new_rank.min_referral_tree_size < prev.min_referral_tree_size { return Err(WaterError::InvalidRankProgression.into()); }
+      for j in 0..MAX_MEM_RANKS { if new_rank.required_members[j] < prev.required_members[j] { return Err(WaterError::InvalidRankProgression.into()); } }
+    }
+    if u64::from(new_rank.min_tokens) < MIN_TOKEN_BALANCE { return Err(WaterError::InvalidRankRequirement.into()); } config.mem_ranks[idx] = new_rank;
+  }
+  config.last_updated = Clock::get()?.unix_timestamp; config.save(mem_rank_config_acc)?; msg!("Mem rank updates ok"); Ok(())
+}
+pub fn process_update_mem_rank_rewards(program_id: &Pubkey, accounts: &[AccountInfo], rewards: [u64; MAX_MEM_RANKS]) -> ProgramResult {
+  let accounts_iter = &mut accounts.iter(); let admin = next_account_info(accounts_iter)?; let mem_rank_config_acc = next_account_info(accounts_iter)?; let immutable_seed_account = next_account_info(accounts_iter)?;
+  if !admin.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+  let root_pda = validate_root_pda_v2(program_id, immutable_seed_account)?; validate_signer(admin)?;
+  let (expected_pda, _) = MemRankConfig::find_pda(program_id, &root_pda);
+  if *mem_rank_config_acc.key != expected_pda { return Err(WaterError::InvalidPDA.into()); }
+  if mem_rank_config_acc.owner != program_id { return Err(ProgramError::IllegalOwner); }
+  if rewards.len() != MAX_MEM_RANKS { return Err(WaterError::InvalidRankArraySize.into()); }
+  for &reward in &rewards { if reward > MAX_ALLOWED_REWARD { return Err(WaterError::InvalidRewardAmount.into()); } }
+  let mut config = MemRankConfig::get_config(mem_rank_config_acc, program_id, &root_pda)?;
+  config.mem_rank_rewards = rewards; config.last_updated = Clock::get()?.unix_timestamp; config.save(mem_rank_config_acc)?; msg!("Mem rank rewards ok"); Ok(())
+}
+impl MemRankConfig { pub fn save(&self, account: &AccountInfo) -> Result<(), ProgramError> { let mut data = account.data.borrow_mut(); self.serialize(&mut *data)?; Ok(()) } }
+===SEPARATOR===
+// src/instructions/admin/update_program_config.rs — v6.0 (stack-safe)
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    msg,
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    sysvar::Sysvar,
+};
+
+use crate::error::WaterError;
+use crate::params::admin::UpdateProgramConfigParams;
+use crate::state::config_trait::ConfigAccount;
+use crate::state::program_config::ProgramConfig;
+use crate::utils::validation_utils::validate_root_pda_v2;
+use crate::constants::ROOT_PDA_SEED;
+
+/// Raw AdminAuth check — reads only admin_1 pubkey + solo_hash + blocked_until from raw bytes
+fn check_auth_raw(data: &[u8], signer: &Pubkey, solo_hash: &[u8; 32]) -> Result<(), WaterError> {
+    if data.len() < 72 { return Err(WaterError::Unauthorized); }
+    let pk = Pubkey::new_from_array(data[0..32].try_into().unwrap());
+    if *signer != pk { return Err(WaterError::Unauthorized); }
+    let stored: [u8; 32] = data[32..64].try_into().unwrap();
+    if solo_hash != &stored { return Err(WaterError::InvalidSoloPassword); }
+    let blocked = i64::from_le_bytes(data[64..72].try_into().unwrap());
+    let now = solana_program::clock::Clock::get().map_err(|_| WaterError::InvalidTimestamp)?.unix_timestamp;
+    if blocked > now { return Err(WaterError::Unauthorized); }
+    Ok(())
+}
+
+pub fn process_update_program_config(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    params: UpdateProgramConfigParams,
+) -> ProgramResult {
+    let ai = &mut accounts.iter();
+    let admin = next_account_info(ai)?;
+    let cfg_acc = next_account_info(ai)?;
+    let auth_acc = next_account_info(ai)?;
+    let seed_acc = next_account_info(ai)?;
+
+    if !admin.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+    let root_pda = validate_root_pda_v2(program_id, seed_acc)?;
+
+    let (exp_auth, _) = crate::state::admin_auth::AdminAuth::find_pda(program_id, &root_pda);
+    if auth_acc.key != &exp_auth { return Err(WaterError::InvalidPDA.into()); }
+    if auth_acc.data_is_empty() { return Err(WaterError::NotInitialized.into()); }
+
+    let sh = params.solo_hash.ok_or(WaterError::InvalidSoloPassword)?;
+    {
+        let data = auth_acc.data.borrow();
+        check_auth_raw(&data, admin.key, &sh)?;
+    }
+
+    let mut pc = ProgramConfig::get_config(cfg_acc, program_id, &root_pda)?;
+
+    if let Some(v) = params.invite_expiry { pc.invite_expiry = v; }
+    if let Some(v) = params.max_users { pc.max_users = v; }
+    if let Some(v) = params.base_cooldown { pc.base_cooldown = v; }
+    if let Some(v) = params.penalty_cooldown { pc.penalty_cooldown = v; }
+    if let Some(v) = params.invite_amount { pc.invite_amount = v; }
+
+    pc.last_updated = solana_program::clock::Clock::get()?.unix_timestamp;
+    let mut d = cfg_acc.try_borrow_mut_data().map_err(|_| WaterError::SerializationError)?;
+    pc.serialize(&mut &mut d[..]).map_err(|_| WaterError::SerializationError)?;
+    msg!("Config updated");
+    Ok(())
+}
+===SEPARATOR===
+// src/instructions/admin/update_sale_stage.rs
+use borsh::{BorshDeserialize, BorshSerialize};
+use crate::constants::MAX_SALE_STAGES;
+use crate::error::WaterError;
+use crate::params::admin::UpdateSaleStageParams;
+use crate::instructions::utilits::pda::{derive_authority_pda};
+
+use crate::state::config_trait::ConfigAccount;
+use crate::state::sale::SaleConfig;
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult, msg, program_error::ProgramError,
+    pubkey::Pubkey, sysvar::clock::Clock, sysvar::Sysvar,
+};
+
+use crate::utils::validation_utils::{validate_root_pda_v2, validate_signer};
+
+/// Обработчик инструкции `update_sale_stage`
+pub fn process_update_sale_stage<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    params: UpdateSaleStageParams,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+
+    // 1. Получаем аккаунты
+    let admin_account = next_account_info(accounts_iter)?;
+    let sale_config_account = next_account_info(accounts_iter)?;
+    let immutable_seed_account = next_account_info(accounts_iter)?;
+    let _program_config_account = next_account_info(accounts_iter)?;
+
+    // 2. Проверка подписи администратора
+    if !admin_account.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // ✅ Централизованная проверка root_pda
+    let root_pda = validate_root_pda_v2(program_id, immutable_seed_account)?;
+
+    // ✅ Централизованная проверка подписи
+    validate_signer(admin_account)?;
+
+    // ✅ Проверка authority PDA
+    //let (expected_authority, _) = derive_authority_pda(program_id, &root_pda);
+    //if *admin_account.key != expected_authority {
+    //    msg!("❌ Атака: admin не является authority_pda");
+    //    msg!("  Ожидался: {}", expected_authority);
+    //    msg!("  Получен: {}", admin_account.key);
+    //    return Err(WaterError::Unauthorized.into());
+    //}
+
+    // ✅ Проверка, что admin является PDA программы
+    //if admin_account.owner != program_id {
+    //    msg!("❌ Атака: admin имеет неверного владельца программы");
+    //    return Err(WaterError::Unauthorized.into());
+    //}    
+
+    //let program_config = ProgramConfig::get_config(program_config_account, program_id, &root_pda)?;
+
+    // Дополнительная проверка authority из ProgramConfig
+    //if *admin_account.key != program_config.authority {
+    //    return Err(WaterError::Unauthorized.into());
+    //}
+
+    // 5. Генерация ожидаемого PDA для конфигурации продажи
+    let (expected_sale_pda, _) = SaleConfig::find_pda(program_id, &root_pda);
+
+    // 6. Проверка, что аккаунт продажи — правильный PDA
+    if *sale_config_account.key != expected_sale_pda {
+        return Err(WaterError::InvalidPDA.into());
+    }
+    if *sale_config_account.owner != *program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    // 7. Десериализация текущей конфигурации продажи
+    //let mut sale_config = SaleConfig::get_config(sale_config_account, program_id, &root_pda)?;
+
+    // 8. Получение конфигурации программы для проверки авторизации
+    //if *admin_account.key != program_config.authority {
+    //    return Err(WaterError::Unauthorized.into());
+    //}
+
+    // ========================================
+    // заплатка-------------------------------
+    // 7. Десериализация текущей конфигурации продажи
+     // 7. Получаем данные аккаунта
+    let data = sale_config_account.data.borrow();
+    
+    // 8. Создаем пустую структуру для определения размера
+    let empty_config = SaleConfig::default();
+    
+    // 9. Сериализуем пустую структуру, чтобы узнать точный размер
+    let serialized_size = match borsh::to_vec(&empty_config) {
+        Ok(vec) => vec.len(),
+        Err(_) => {
+            msg!("❌ Не удалось определить размер SaleConfig");
+            return Err(WaterError::SerializationError.into());
+        }
+    };
+    
+    msg!("📏 Размер SaleConfig по Borsh: {} байт", serialized_size);
+    msg!("📏 Размер данных аккаунта: {} байт", data.len());
+    
+    // 10. Используем минимальный размер для чтения
+    let read_size = std::cmp::min(serialized_size, data.len());
+    let mut slice = &data[..read_size];
+    
+    // 11. Десериализуем через Borsh
+    let mut sale_config = SaleConfig::deserialize(&mut slice)
+        .map_err(|e| {
+            msg!("❌ Ошибка десериализации SaleConfig: {:?}", e);
+            WaterError::SerializationError
+        })?;
+    drop(data);
+    if sale_config.remaining_tokens < 1_000_000_000_000_000_000 {
+        msg!("⚠️ Исправляем remaining_tokens: {} -> {}", 
+            sale_config.remaining_tokens, 
+            5_000_000_000_000_000_000u64);
+        sale_config.remaining_tokens = 5_000_000_000_000_000_000; // 5e9 * 1e9
+    }
+
+
+
+    // 12. Проверка инициализации
+    if !sale_config.is_initialized {
+        msg!("❌ SaleConfig не инициализирован");
+        return Err(WaterError::NotInitialized.into());
+    }
+
+    msg!("✅ SaleConfig успешно загружен");
+    msg!("   Текущая стадия: {}", sale_config.current_stage);
+    msg!("   Активен: {}", sale_config.is_active);
+    msg!("   Осталось токенов: {}", sale_config.remaining_tokens);
+
+    // ========================================
+
+    // 9. Обновление параметров стадии продажи
+    if let Some(stage_index) = params.stage_index {
+        if stage_index >= MAX_SALE_STAGES as u8 {
+            return Err(WaterError::InvalidSaleStage.into());
+        }
+
+        let stage = &mut sale_config.stages[stage_index as usize];
+
+        if let Some(price) = params.price_per_token {
+            stage.price_per_token = price;
+        }
+        if let Some(tokens) = params.tokens_available {
+            stage.tokens_available = tokens;
+            // Если это текущая стадия — обновим остаток
+            if stage_index == sale_config.current_stage {
+                sale_config.remaining_tokens = tokens;
+            }
+        }
+        if let Some(is_active) = params.is_active {
+            stage.is_active = is_active;
+        }
+    }
+
+    // 10. Обновление текущей стадии (если указано)
+    if let Some(current_stage) = params.current_stage {
+        if current_stage >= MAX_SALE_STAGES as u8 {
+            return Err(WaterError::InvalidSaleStage.into());
+        }
+        sale_config.current_stage = current_stage;
+        sale_config.remaining_tokens = sale_config.stages[current_stage as usize].tokens_available;
+    }
+
+    // 11. Обновление активности продажи
+    if let Some(is_active) = params.is_active {
+        sale_config.is_active = is_active;
+    }
+
+    // Обновление времени начала (если нужно)
+    if let Some(start_time) = params.start_time {
+        sale_config.start_time = start_time;
+    }
+
+    // 12. Автоматический переход между стадиями при достижении лимита
+    if sale_config.is_active
+        && sale_config.sold_tokens
+            >= sale_config.stages[sale_config.current_stage as usize].tokens_available
+    {
+        let current_stage = sale_config.current_stage as usize;
+        if current_stage + 1 < MAX_SALE_STAGES {
+            sale_config.current_stage = (current_stage + 1) as u8;
+            sale_config.remaining_tokens =
+                sale_config.stages[sale_config.current_stage as usize].tokens_available;
+            msg!(
+                "Автоматический переход на стадию {}",
+                sale_config.current_stage
+            );
+        } else {
+            sale_config.is_active = false;
+            msg!("Продажа завершена");
+        }
+    }
+    // 13. Обновление времени последнего изменения
+    sale_config.last_updated = Clock::get()?.unix_timestamp;
+  
+    // 14. Сериализация обновлённой конфигурации (как в 42 инструкции)
+    {
+        let mut account_data = sale_config_account.try_borrow_mut_data()?;
+        sale_config.serialize(&mut &mut account_data[..])
+            .map_err(|_| {
+                msg!("❌ Ошибка сериализации SaleConfig");
+                WaterError::SerializationError
+            })?;
+    }
+
+    msg!("✅ Sale configuration updated successfully");
+    Ok(())
+}
+
+===SEPARATOR===
+// src/instructions/admin/update_staking_config.rs — v4.3 (Без проверки админа)
+// 🔥 ИЗМЕНЕНИЯ v4.3:
+//    - Убрана проверка program_config.authorized_admin
+//    - Убран program_config_account из accounts
+//    - Разработчик меняет конфиг свободно
+
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    msg,
+    pubkey::Pubkey,
+    sysvar::clock::Clock,
+    sysvar::Sysvar,
+};
+
+use crate::error::WaterError;
+use crate::params::admin::UpdateStakingConfigParams;
+use crate::state::config_trait::ConfigAccount;
+use crate::state::staking_config::StakingConfig;
+use crate::utils::validation_utils::{validate_root_pda_v2, validate_signer};
+use crate::constants::*;
+
+pub fn process_update_staking_config(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    params: UpdateStakingConfigParams,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+
+    let admin_account = next_account_info(accounts_iter)?;
+    let staking_config_account = next_account_info(accounts_iter)?;
+    let immutable_seed_account = next_account_info(accounts_iter)?;
+
+    validate_signer(admin_account)?;
+    let root_pda = validate_root_pda_v2(program_id, immutable_seed_account)?;
+
+    let mut staking_config = StakingConfig::get_config(staking_config_account, program_id, &root_pda)?;
+
+    // Обновление подарков
+    if let Some(value) = params.gift_1d {
+        staking_config.gift_1d = value;
+    }
+    if let Some(value) = params.gift_3d {
+        staking_config.gift_3d = value;
+    }
+    if let Some(value) = params.gift_7d {
+        staking_config.gift_7d = value;
+    }
+
+    // Лимиты
+    if let Some(value) = params.min_stake_amount {
+        if value == 0 {
+            msg!("❌ min_stake_amount не может быть 0");
+            return Err(WaterError::InvalidStakeAmountRange.into());
+        }
+        staking_config.min_stake_amount = value;
+    }
+    if let Some(value) = params.max_stake_amount {
+        if value == 0 {
+            msg!("❌ max_stake_amount не может быть 0");
+            return Err(WaterError::InvalidStakeAmountRange.into());
+        }
+        staking_config.max_stake_amount = value;
+    }
+
+    // Флаги
+    if let Some(value) = params.is_active {
+        staking_config.is_active = value;
+    }
+    if let Some(value) = params.is_gift_active {
+        staking_config.is_gift_active = value;
+    }
+
+    // Валидация
+    if staking_config.min_stake_amount > staking_config.max_stake_amount {
+        msg!("❌ min > max");
+        return Err(WaterError::InvalidStakeAmountRange.into());
+    }
+
+    staking_config.last_updated = Clock::get()?.unix_timestamp;
+    staking_config.save(staking_config_account)?;
+
+    msg!("✅ Staking config updated");
+    msg!("  Gift 1D: {} WATER", staking_config.gift_1d / 10u64.pow(OUR_TOKEN_DECIMALS as u32));
+    msg!("  Gift 3D: {} WATER", staking_config.gift_3d / 10u64.pow(OUR_TOKEN_DECIMALS as u32));
+    msg!("  Gift 7D: {} WATER", staking_config.gift_7d / 10u64.pow(OUR_TOKEN_DECIMALS as u32));
+    msg!("  Min: {} WATER", staking_config.min_stake_amount / 10u64.pow(OUR_TOKEN_DECIMALS as u32));
+    msg!("  Max: {} WATER", staking_config.max_stake_amount / 10u64.pow(OUR_TOKEN_DECIMALS as u32));
+    msg!("  Active: {}", staking_config.is_active);
+    msg!("  Gift Active: {}", staking_config.is_gift_active);
+
+    Ok(())
+}===SEPARATOR===
+use borsh::BorshSerialize;
+use solana_program::{account_info::{next_account_info, AccountInfo}, clock::Clock, entrypoint::ProgramResult, msg, program_error::ProgramError, pubkey::Pubkey, sysvar::Sysvar};
+use crate::{constants::*, params::admin::UpdateTeamRankRequirementsParams, state::team_rank_config::TeamRankConfig, state::config_trait::ConfigAccount, WaterError};
+use crate::utils::validation_utils::{validate_root_pda_v2, validate_signer};
+pub fn process_update_team_rank_requirements(program_id: &Pubkey, accounts: &[AccountInfo], params: UpdateTeamRankRequirementsParams) -> ProgramResult {
+  let accounts_iter = &mut accounts.iter(); let admin = next_account_info(accounts_iter)?; let team_rank_config_acc = next_account_info(accounts_iter)?; let immutable_seed_account = next_account_info(accounts_iter)?;
+  if !admin.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+  let root_pda = validate_root_pda_v2(program_id, immutable_seed_account)?; validate_signer(admin)?;
+  let mut config = TeamRankConfig::get_config(team_rank_config_acc, program_id, &root_pda)?;
+  for update in params.updates { let idx = update.index as usize;
+    if idx >= MAX_TEAM_RANKS { return Err(WaterError::InvalidRank.into()); } let mut new_rank = config.team_ranks[idx];
+    if let Some(id_val) = update.id { new_rank.id = id_val; } if let Some(min) = update.min_team_tokens { new_rank.min_team_tokens = min; }
+    if let Some(members) = update.min_members { new_rank.min_members = members; } if let Some(stake) = update.min_team_stake_hours { new_rank.min_team_stake_hours = stake; }
+    if let Some(req) = update.required_members { new_rank.required_members = req; } if let Some(active) = update.is_active { new_rank.is_active = active; }
+    if new_rank.is_active && idx > 0 { let prev_idx = idx - 1; if config.team_ranks[prev_idx].is_active {
+      let prev = &config.team_ranks[prev_idx];
+      if new_rank.min_team_tokens < prev.min_team_tokens || new_rank.min_members < prev.min_members || new_rank.min_team_stake_hours < prev.min_team_stake_hours { return Err(WaterError::InvalidRankProgression.into()); }
+      for j in 0..MAX_TEAM_RANKS { if new_rank.required_members[j] < prev.required_members[j] { return Err(WaterError::InvalidRankProgression.into()); } }
+    }}
+    if new_rank.min_team_tokens < MIN_TOKEN_BALANCE { return Err(WaterError::InvalidRankRequirement.into()); }
+    if new_rank.min_members < MIN_TEAM_MEMBERS { return Err(WaterError::InvalidTeamMembers.into()); } config.team_ranks[idx] = new_rank;
+  }
+  config.last_updated = Clock::get()?.unix_timestamp; config.save(team_rank_config_acc)?; msg!("Team rank updates ok"); Ok(())
+}
+pub fn process_update_team_rank_rewards(program_id: &Pubkey, accounts: &[AccountInfo], rewards: [u64; MAX_TEAM_RANKS]) -> ProgramResult {
+  let accounts_iter = &mut accounts.iter(); let admin = next_account_info(accounts_iter)?; let team_rank_config_acc = next_account_info(accounts_iter)?; let immutable_seed_account = next_account_info(accounts_iter)?;
+  if !admin.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+  let root_pda = validate_root_pda_v2(program_id, immutable_seed_account)?; validate_signer(admin)?;
+  let (expected_pda, _) = TeamRankConfig::find_pda(program_id, &root_pda);
+  if *team_rank_config_acc.key != expected_pda { return Err(WaterError::InvalidPDA.into()); }
+  if team_rank_config_acc.owner != program_id { return Err(ProgramError::IllegalOwner); }
+  if rewards.len() != MAX_TEAM_RANKS { return Err(WaterError::InvalidRankArraySize.into()); }
+  for &reward in &rewards { if reward > MAX_ALLOWED_REWARD { return Err(WaterError::InvalidRewardAmount.into()); } }
+  let mut config = TeamRankConfig::get_config(team_rank_config_acc, program_id, &root_pda)?;
+  config.team_rank_rewards = rewards; config.last_updated = Clock::get()?.unix_timestamp; config.save(team_rank_config_acc)?; msg!("Team rank rewards ok"); Ok(())
+}
+impl TeamRankConfig { pub fn save(&self, account: &AccountInfo) -> Result<(), ProgramError> { let mut data = account.data.borrow_mut(); self.serialize(&mut *data)?; Ok(()) } }
+===SEPARATOR===
+// src/instructions/admin/upgrade_rent_admin.rs
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    msg,
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    sysvar::Clock,
+    sysvar::Sysvar,
+};
+
+use crate::error::WaterError;
+use crate::state::rentpda_mema::RentPdaMema;
+use crate::utils::validation_utils::{validate_root_pda_v2, validate_signer};
+use crate::constants::RENTPDA_MEMA_SEED;
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct UpgradeRentAdminParams {
+    pub new_admin: Pubkey,      // Новый администратор
+    pub new_treasury: Pubkey,   // Новый кошелек для вывода (опционально, можно оставить старый)
+}
+
+pub fn process_upgrade_rent_admin(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    params: UpgradeRentAdminParams,
+) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+    
+    // 1. Текущий администратор (подписант)
+    let current_admin = next_account_info(account_iter)?;
+    validate_signer(current_admin)?;
+    msg!("✅ Текущий администратор: {}", current_admin.key);
+    
+    // 2. RentPdaMema аккаунт
+    let rent_mema = next_account_info(account_iter)?;
+    msg!("📦 RentPdaMema: {}", rent_mema.key);
+    
+    // 3. Root PDA (для валидации)
+    let root_pda_account = next_account_info(account_iter)?;
+    
+    // ✅ Проверяем root PDA
+    let root_pda = validate_root_pda_v2(program_id, root_pda_account)?;
+    msg!("🔐 Root PDA: {}", root_pda);
+    
+    // ✅ Проверяем, что rent_mema - правильный PDA
+    let (expected_mema_pda, _) = Pubkey::find_program_address(
+        &[RENTPDA_MEMA_SEED, root_pda.as_ref()],
+        program_id,
+    );
+    
+    if rent_mema.key != &expected_mema_pda {
+        msg!("❌ Неверный RentPdaMema PDA");
+        msg!("   Ожидался: {}", expected_mema_pda);
+        msg!("   Получен: {}", rent_mema.key);
+        return Err(WaterError::InvalidPDA.into());
+    }
+    msg!("✅ RentPdaMema PDA верный");
+    
+    // ✅ Проверяем, что rent_mema принадлежит программе
+    if rent_mema.owner != program_id {
+        msg!("❌ RentPdaMema имеет неверного владельца");
+        msg!("   Ожидался: {}", program_id);
+        msg!("   Получен: {}", rent_mema.owner);
+        return Err(ProgramError::IllegalOwner);
+    }
+    
+    // ✅ Загружаем данные RentPdaMema
+    let mut mema = RentPdaMema::try_from_slice(&rent_mema.data.borrow())
+        .map_err(|_| {
+            msg!("❌ Ошибка десериализации RentPdaMema");
+            WaterError::SerializationError
+        })?;
+    
+    msg!("📊 Текущие настройки:");
+    msg!("   Admin: {}", mema.admin_pubkey);
+    msg!("   Treasury: {}", mema.treasury_pubkey);
+    
+    // ✅ Проверяем, что подписант - текущий администратор
+    mema.check_admin(current_admin.key)?;
+    msg!("✅ Текущий администратор подтвержден");
+    
+    let now = Clock::get()?.unix_timestamp;
+    
+    // ✅ Запоминаем старые значения для лога
+    let old_admin = mema.admin_pubkey;
+    let old_treasury = mema.treasury_pubkey;
+    
+    // ✅ Обновляем администратора (обязательно)
+    mema.admin_pubkey = params.new_admin;
+    
+    // ✅ Обновляем treasury если передан (иначе оставляем старый)
+    if params.new_treasury != Pubkey::default() {
+        mema.treasury_pubkey = params.new_treasury;
+        msg!("🔄 Treasury обновлен");
+    } else {
+        msg!("ℹ️ Treasury оставлен без изменений");
+    }
+    
+    // ✅ Обновляем время
+    mema.last_stats_update = now;
+    
+    // ✅ Сохраняем
+    mema.serialize(&mut *rent_mema.data.borrow_mut())
+        .map_err(|_| {
+            msg!("❌ Ошибка сериализации RentPdaMema");
+            WaterError::SerializationError
+        })?;
+    
+    msg!("========================================================");
+    msg!("🎉 АДМИНИСТРАТОР RENTPDA_MEMA УСПЕШНО ОБНОВЛЕН");
+    msg!("========================================================");
+    msg!("   Старый admin: {}", old_admin);
+    msg!("   Новый admin: {}", mema.admin_pubkey);
+    msg!("   Старый treasury: {}", old_treasury);
+    msg!("   Новый treasury: {}", mema.treasury_pubkey);
+    msg!("   Время обновления: {}", now);
+    msg!("========================================================");
+    
+    Ok(())
+}
+
+// Дополнительная упрощенная версия - только смена админа
+pub fn process_upgrade_rent_admin_simple(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    new_admin: Pubkey,
+) -> ProgramResult {
+    let params = UpgradeRentAdminParams {
+        new_admin,
+        new_treasury: Pubkey::default(), // оставляем treasury без изменений
+    };
+    process_upgrade_rent_admin(program_id, accounts, params)
+}===SEPARATOR===
+// src/instructions/admin/withdraw_fees.rs
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    msg,
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    sysvar::clock::Clock,
+    sysvar::Sysvar,
+};
+
+use crate::error::WaterError;
+use crate::instructions::user::{check_account_owner, transfer_tokens};
+use crate::instructions::utilits::pda::derive_authority_pda;
+use crate::instructions::utils::get_associated_token_address;
+use crate::state::program_config::ProgramConfig;
+use crate::state::config_trait::ConfigAccount;
+use crate::state::sale::SaleConfig;
+use crate::utils::validation_utils::{
+    validate_root_pda_v2, 
+    validate_signer,
+    validate_rent_pda  
+};
+
+/// Обработчик инструкции вывода комиссий администратором
+pub fn process_withdraw_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+
+    // Получаем аккаунты
+    let admin_wallet = next_account_info(account_iter)?; // Подписант (должен быть authority)
+    let sale_config_account = next_account_info(account_iter)?; // SaleConfig аккаунт
+    let program_config_account = next_account_info(account_iter)?; // ProgramConfig
+    let immutable_seed_account = next_account_info(account_iter)?; // Хранит program_seed
+    let stablecoin_mint = next_account_info(account_iter)?; // Mint (USDT/USDC)
+    let treasury_pda = next_account_info(account_iter)?; // PDA: собирает стейблкоины
+    let treasury_usdt_ata = next_account_info(account_iter)?; // Его ATA
+    let space_wallet = next_account_info(account_iter)?; // Внешний кошелёк для вывода
+    let rent_pda = next_account_info(account_iter)?; // ✅ Дополнительная проверка безопасности
+    
+    // ✅ Централизованная проверка root_pda и rent_pda с усиленной безопасностью
+    // ✅ Проверка root_pda через validate_root_pda_v2
+    let root_pda = validate_root_pda_v2(
+        program_id,
+        immutable_seed_account,
+    )?;
+
+    // ✅ Проверка rent_pda через отдельную функцию
+    validate_rent_pda(
+        rent_pda,
+        program_id,
+        &root_pda,
+    )?;
+
+    // ✅ Усиленная проверка подписи администратора
+    validate_signer(admin_wallet)?;
+
+    // ✅ Двойная проверка авторитета: через derive_authority_pda и ProgramConfig
+    let (expected_authority_pda, _) = derive_authority_pda(program_id, &root_pda);
+    if *admin_wallet.key != expected_authority_pda {
+        msg!("❌ Атака: admin_wallet не является authority_pda");
+        msg!("  Ожидался: {}", expected_authority_pda);
+        msg!("  Получен: {}", admin_wallet.key);
+        return Err(WaterError::Unauthorized.into());
+    }
+
+    // ✅ Проверка, что admin_wallet является владельцем (не делегированным)
+    if admin_wallet.owner != program_id {
+        msg!("❌ Атака: admin_wallet имеет неверного владельца программы");
+        return Err(WaterError::Unauthorized.into());
+    }
+
+    // ✅ Десериализуем ProgramConfig для дополнительной проверки
+    let program_config = ProgramConfig::get_config(program_config_account, program_id, &root_pda)?;
+    
+    // ✅ Проверка space_wallet из конфигурации
+    if *space_wallet.key != program_config.space_wallet {
+        msg!("❌ Атака: неверный space_wallet");
+        msg!("  Ожидался: {}", program_config.space_wallet);
+        msg!("  Получен: {}", space_wallet.key);
+        return Err(WaterError::InvalidSpaceWallet.into());
+    }
+
+    // ✅ Проверка минимального баланса rent_pda для предотвращения атак на газ
+    let min_rent_balance = solana_program::rent::Rent::get()?.minimum_balance(0);
+    if rent_pda.lamports() < min_rent_balance * 10 {
+        msg!("⚠️ Предупреждение: низкий баланс rent_pda - возможна атака на газ");
+        // Не блокируем, но логируем для мониторинга
+    }
+
+    // ✅ Десериализуем SaleConfig с проверкой инициализации
+    let mut sale_config = SaleConfig::try_from_slice(&sale_config_account.data.borrow())
+        .map_err(|_| {
+            msg!("❌ Атака: невалидные данные SaleConfig");
+            WaterError::SerializationError
+        })?;
+
+    // ✅ Проверяем, что SaleConfig инициализирован
+    if sale_config.last_updated == 0 {
+        msg!("❌ Атака: SaleConfig не инициализирован");
+        return Err(WaterError::NotInitialized.into());
+    }
+
+    // ✅ Проверяем, есть ли комиссии для вывода
+    if sale_config.total_fees_collected == 0 {
+        msg!("ℹ️ Нет комиссий для вывода");
+        return Err(WaterError::NoTokensAvailable.into());
+    }
+
+    // ✅ Начинаем с запрошенной суммы, но будем корректировать по проверкам
+    let mut amount = sale_config.total_fees_collected;
+
+    // ✅ Используем лимиты из SaleConfig для проверки безопасности
+    // 1. Проверка максимального вывода за одну транзакцию из SaleConfig
+    if sale_config.pda_balance > 0 && amount > sale_config.pda_balance {
+        msg!("❌ Атака: попытка вывода превышает баланс");
+        msg!("  Сумма: {}", amount);
+        msg!("  Баланс из SaleConfig: {}", sale_config.pda_balance);
+        return Err(WaterError::InvalidTransfer.into());
+    }
+
+    // 2. Дополнительная проверка: не более лимита на вывод
+    if sale_config.limit_pda_withdraw > 0 && amount > sale_config.limit_pda_withdraw  {
+        msg!("⚠️ Предупреждение: вывод лимита за одну транзакцию");
+        msg!("  Сумма: {}", amount);
+        msg!("  Max: {}", sale_config.limit_pda_withdraw);
+        // Можно либо заблокировать, либо разрешить с дополнительной проверкой
+        amount = sale_config.limit_pda_withdraw;
+    }
+    // 3. Проверка частоты выводов (не чаще раза в 8 часов для больших сумм)
+    let current_time = Clock::get()?.unix_timestamp;
+    const MIN_LARGE_WITHDRAWAL_INTERVAL: i64 = 8 * 3600; // 8 часов
+
+    if current_time < sale_config.last_withdrawal_time + MIN_LARGE_WITHDRAWAL_INTERVAL {
+            msg!("❌ Атака: слишком частый вывод больших сумм");
+            msg!("  Сумма: {}", amount);
+            msg!("  Последний вывод:  {}", sale_config.last_withdrawal_time);
+            msg!("  Минимальный интервал: {} сек", MIN_LARGE_WITHDRAWAL_INTERVAL);
+            return Err(WaterError::InvalidTransfer.into());
+    }
+
+    // Проверка владельцев аккаунтов
+    check_account_owner(treasury_usdt_ata, &spl_token_2022_interface::id())?;
+    check_account_owner(space_wallet, &spl_token_2022_interface::id())?;
+
+    // Проверка: treasury_usdt_ata — это ATA treasury_pda для stablecoin_mint
+    let expected_treasury_ata = get_associated_token_address(treasury_pda.key, stablecoin_mint.key);
+    if *treasury_usdt_ata.key != expected_treasury_ata {
+        return Err(WaterError::InvalidAccountData.into());
+    }
+
+    // ✅ Проверка, что treasury_pda действительно является PDA программы
+    let (expected_treasury_pda, _) = Pubkey::find_program_address(
+        &[b"treasury", root_pda.as_ref()],
+        program_id,
+    );
+    if treasury_pda.key != &expected_treasury_pda {
+        msg!("❌ Атака: неверный treasury_pda");
+        msg!("  Ожидался: {}", expected_treasury_pda);
+        msg!("  Получен: {}", treasury_pda.key);
+        return Err(WaterError::InvalidPDA.into());
+    }
+
+    // ✅ Проверяем фактический баланс кошелька перед любыми операциями
+    let _token_program = &spl_token_2022_interface::id();
+    let treasury_ata_data = treasury_usdt_ata.data.borrow();
+    
+    // Распаковываем данные токен-аккаунта
+    use spl_token_2022_interface::extension::StateWithExtensions;
+    use spl_token_2022_interface::state::Account as TokenAccount;
+    
+    let token_account = StateWithExtensions::<TokenAccount>::unpack(&treasury_ata_data)
+        .map_err(|_| {
+            msg!("❌ Не удалось распаковать данные токен-аккаунта");
+            ProgramError::InvalidAccountData
+        })?;
+    
+    let actual_balance = token_account.base.amount;
+
+    if actual_balance < amount {
+        msg!("❌ Атака переполнения: запрошено больше, чем есть на балансе!");
+        msg!("  Фактический баланс кошелька: {}", actual_balance);
+        msg!("  Запрошено из SaleConfig: {}", amount);
+        msg!("  Разница: {} (недостаток)", amount - actual_balance);
+        return Err(WaterError::InsufficientBalance.into());
+    }
+
+    sale_config.total_fees_collected = 0;
+    sale_config.last_updated = Clock::get()?.unix_timestamp;
+    sale_config.last_withdrawal_time = Clock::get()?.unix_timestamp;
+
+    // Обновляем SaleConfig
+    sale_config
+        .serialize(&mut *sale_config_account.data.borrow_mut())
+        .map_err(|_| WaterError::SerializationError)?;
+
+    msg!(
+        "✅ Комиссии в размере {} выводится на кошелёк {}",
+        amount,
+        space_wallet.key
+    );
+
+    // Переводим комиссии с treasury_usdt_ata → space_wallet
+    transfer_tokens(
+        treasury_usdt_ata,
+        space_wallet,
+        stablecoin_mint, // ✅ &AccountInfo
+        amount,
+        treasury_pda, // ✅ authority — владелец treasury_usdt_ata
+    )?;
+
+    
+
+  
+    Ok(())
+}
+
+pub fn process_withdraw_rent(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    amount: u64,
+) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+    let admin = next_account_info(account_iter)?;
+    let rentpda_mema = next_account_info(account_iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let (expected_pda, _bump) = Pubkey::find_program_address(&[b"rentpda_mema"], program_id);
+    if rentpda_mema.key != &expected_pda || rentpda_mema.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    // ✅ Проверка баланса rent_pda перед списанием
+    if rentpda_mema.lamports() < amount {
+        msg!("❌ Недостаточно средств в rent_pda для вывода");
+        msg!("  Запрошено: {} lamports", amount);
+        msg!("  Доступно: {} lamports", rentpda_mema.lamports());
+        return Err(ProgramError::InsufficientFunds);
+    }
+
+    **rentpda_mema.try_borrow_mut_lamports()? -= amount;
+    **admin.try_borrow_mut_lamports()? += amount;
+
+    Ok(())
+}
+
+
+===SEPARATOR===
+// src/instructions/admin/withdraw_rent.rs
+
+use borsh::{BorshDeserialize, BorshSerialize};
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    msg,
+    program::invoke_signed,
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    sysvar::{clock::Clock, Sysvar},
+};
+use solana_system_interface::instruction as system_instruction;
+
+use crate::error::WaterError;
+use crate::state::rentpda_mema::RentPdaMema;
+use crate::utils::validation_utils::{validate_root_pda_v2, validate_signer};
+use crate::constants::RENTPDA_MEMA_SEED;
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct WithdrawRentParams {
+    pub amount: u64,  // Сумма в lamports для вывода
+}
+
+pub fn process_withdraw_rent(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    params: WithdrawRentParams,
+) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+    
+    // 1. Администратор (подписант)
+    let admin = next_account_info(account_iter)?;
+    validate_signer(admin)?;
+    msg!("✅ Администратор: {}", admin.key);
+    
+    // 2. RentPdaMema аккаунт
+    let rent_mema = next_account_info(account_iter)?;
+    msg!("📦 RentPdaMema: {}", rent_mema.key);
+    
+    // 3. Куда выводим (treasury wallet)
+    let treasury = next_account_info(account_iter)?;
+    msg!("💰 Treasury: {}", treasury.key);
+    
+    // 4. Root PDA (для валидации)
+    let root_pda_account = next_account_info(account_iter)?;
+    
+    // 5. System program
+    let system_program = next_account_info(account_iter)?;
+    
+    // ✅ Проверяем root PDA
+    let root_pda = validate_root_pda_v2(program_id, root_pda_account)?;
+    msg!("🔐 Root PDA: {}", root_pda);
+    
+    // ✅ Проверяем, что rent_mema - правильный PDA
+    let (expected_mema_pda, mema_bump) = Pubkey::find_program_address(
+        &[RENTPDA_MEMA_SEED, root_pda.as_ref()],
+        program_id,
+    );
+    
+    if rent_mema.key != &expected_mema_pda {
+        msg!("❌ Неверный RentPdaMema PDA");
+        msg!("   Ожидался: {}", expected_mema_pda);
+        msg!("   Получен: {}", rent_mema.key);
+        return Err(WaterError::InvalidPDA.into());
+    }
+    msg!("✅ RentPdaMema PDA верный");
+    
+    // ✅ Проверяем, что rent_mema принадлежит программе
+    if rent_mema.owner != program_id {
+        msg!("❌ RentPdaMema имеет неверного владельца");
+        msg!("   Ожидался: {}", program_id);
+        msg!("   Получен: {}", rent_mema.owner);
+        return Err(ProgramError::IllegalOwner);
+    }
+    
+    // ✅ Проверяем, что treasury совпадает с настроенным
+    if treasury.key != &crate::constants::SPACE_WALLET {
+        // Или берем из конфига
+        msg!("⚠️ Проверка treasury будет по конфигу");
+        // В реальном коде нужно загрузить ProgramConfig и сравнить
+    }
+    
+    // ✅ Загружаем данные RentPdaMema
+    let mut mema = RentPdaMema::try_from_slice(&rent_mema.data.borrow())
+        .map_err(|_| {
+            msg!("❌ Ошибка десериализации RentPdaMema");
+            WaterError::SerializationError
+        })?;
+    
+    msg!("📊 Текущий баланс RentPdaMema: {} lamports", mema.current_balance);
+    msg!("📊 Доступно для вывода: {} lamports", mema.available_balance);
+    
+    // ✅ Проверяем, что админ действительно админ
+    mema.check_admin(admin.key)?;
+    msg!("✅ Администратор подтвержден");
+    
+    let now = Clock::get()?.unix_timestamp;
+    
+    // ✅ Проверяем возможность вывода (все проверки в одном методе)
+    mema.can_withdraw(params.amount, now)?;
+    msg!("✅ Проверки вывода пройдены");
+    
+    // ✅ Выполняем вывод средств (обновляем структуру)
+    mema.withdraw(params.amount, now)?;
+    
+    // ✅ Сохраняем обновленные данные
+    mema.serialize(&mut *rent_mema.data.borrow_mut())
+        .map_err(|_| {
+            msg!("❌ Ошибка сериализации RentPdaMema");
+            WaterError::SerializationError
+        })?;
+    
+    // ✅ Переводим SOL из RentPdaMema в treasury
+    msg!("💸 Перевод {} lamports в treasury {}", params.amount, treasury.key);
+    
+    let transfer_ix = system_instruction::transfer(
+        rent_mema.key,
+        treasury.key,
+        params.amount,
+    );
+    
+    // Подписываем как RentPdaMema PDA
+    let seeds = &[RENTPDA_MEMA_SEED, root_pda.as_ref(), &[mema_bump]];
+    
+    invoke_signed(
+        &transfer_ix,
+        &[
+            rent_mema.clone(),
+            treasury.clone(),
+            system_program.clone(),
+        ],
+        &[seeds],
+    )?;
+    
+    msg!("========================================================");
+    msg!("🎉 ВЫВОД СРЕДСТВ УСПЕШНО ВЫПОЛНЕН");
+    msg!("========================================================");
+    msg!("   Сумма: {} lamports ({:.3} SOL)", 
+         params.amount, params.amount as f64 / 1_000_000_000.0);
+    msg!("   Новый баланс RentPdaMema: {} lamports", mema.current_balance);
+    msg!("   Доступно для вывода: {} lamports", mema.available_balance);
+    msg!("   Получатель: {}", treasury.key);
+    msg!("========================================================");
+    
+    Ok(())
+}

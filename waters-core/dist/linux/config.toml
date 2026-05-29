@@ -1,0 +1,10 @@
+[node]
+name = "waters-node"
+id = ""
+workspace = "."
+session_dir = ".waters/sessions"
+llm_provider = "auto"
+
+[ollama]
+url = "http://127.0.0.1:11434"
+model = "qwen2.5:14b"
