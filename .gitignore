@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Secrets (эти файлы не попадут в Git)
 .env
 .env.*
@@ -54,3 +53,8 @@ Thumbs.db
 # WATERS Node v0.6.0 documentation (server-only, not for Git)
 docs/waters-node-v0.6.0-quantum-spec.md
 docs/waters-node-v0.6.0-quantum-spec-detailed.md
+
+# Temporary files for missions (не попадают в Git)
+missions/**/.pids/
+missions/**/artifacts/
+missions/**/reports/
