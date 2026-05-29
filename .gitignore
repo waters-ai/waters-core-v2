@@ -40,6 +40,7 @@ Thumbs.db
 .secrets/
 *.enc
 /opt/waters/secrets/
+.chroma_data/
 
 # Secrets
 .serve_password
