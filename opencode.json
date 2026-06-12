@@ -1,5 +1,5 @@
 {
-  "$schema": "https://opencode.ai/config.json",
+ "$schema": "https://opencode.ai/config.json",    
   "provider": {
     "deepseek": {
       "name": "DeepSeek (WATERS Primary)",
