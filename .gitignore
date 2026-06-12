@@ -18,6 +18,7 @@
 /live/
 /waters-node-v2/
 /waters-node2/
+/knowledge-center/
 
 # Logs and temporary files
 *.log
@@ -59,3 +60,4 @@ docs/waters-node-v0.6.0-quantum-spec-detailed.md
 missions/**/.pids/
 missions/**/artifacts/
 missions/**/reports/
+
